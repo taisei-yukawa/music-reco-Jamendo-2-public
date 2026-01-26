@@ -69,7 +69,7 @@ QUERY_TRACKS: Dict[str, str] = {
     "pop": "1030923",
 }
 
-# 永続ファイル（Cloudでは再デプロイで消える可能性あり）
+# 永続ファイル（Streamlit Cloudは再デプロイで消える可能性あり）
 COUNTERS_FILE = BASE_DIR / "genre_counter.json"
 LOG_FILE = BASE_DIR / "sessions_log.csv"
 COMPLETED_FILE = BASE_DIR / "completed_sessions.json"
@@ -109,7 +109,12 @@ def l2_unit(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     n = float(np.linalg.norm(x))
     return x / (n + eps)
 
-def cosine_topk(V: np.ndarray, q: np.ndarray, topk: int, exclude_idx: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+def cosine_topk(
+    V: np.ndarray,
+    q: np.ndarray,
+    topk: int,
+    exclude_idx: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray]:
     sims = V @ q
     if exclude_idx is not None and 0 <= exclude_idx < len(sims):
         sims[exclude_idx] = -1e9
@@ -344,6 +349,7 @@ if "initialised" not in st.session_state:
                 base_idx = int(np.argmax(mask.values))
 
         if base_idx is None:
+            # 見つからない場合はランダム（実験では避けたい）
             rng_tmp = np.random.default_rng(RANDOM_SEED)
             base_idx = int(rng_tmp.integers(0, len(V)))
             st.session_state["query_track_id"] = str(meta.loc[base_idx].get("track_id", ""))
@@ -377,12 +383,210 @@ with st.sidebar:
         st.write(f"Session ID: {st.session_state.get('session_id')}")
         st.write(f"Query track_id: {st.session_state.get('query_track_id')}")
 
-        st.write("---")
-        c = load_counters()
-        st.write("Completed counters:")
-        for g in PRIMARY_GENRES + [RESERVE_GENRE]:
-            limit = PRIMARY_LIMIT if g in PRIMARY_GENRES else POP_LIMIT
-            st.write(f"- {g}: {c.get(g,0)}/{limit}")
+# Phase update by time
+now = time.time()
+if st.session_state.get("phase") == 1 and now - st.session_state.get("init_time", 0) >= 15:
+    st.session_state["phase"] = 2
+if st.session_state.get("phase") == 3 and st.session_state.get("step3_time") is not None:
+    if now - st.session_state["step3_time"] >= 20:
+        st.session_state["phase"] = 4
 
-# 以降（Step1〜）はあなたの現行続きがあるはずなので、
-# この下に元のStep1/Step2/Step3/Step4部分をそのまま続けてください。
+
+###############################################################################
+# Playback helper
+###############################################################################
+def play_by_meta_row(row: pd.Series, label: str = "") -> None:
+    """
+    meta行の drive_file_id からダウンロード→st.audio で再生する。
+    """
+    file_id = str(row.get("drive_file_id", "") or "").strip()
+    if not file_id:
+        st.warning("⚠️ 音源が再生できません（drive_file_id が空です）。")
+        return
+    try:
+        audio_bytes = download_mp3_bytes_from_drive(file_id)
+        if label:
+            st.caption(label)
+        st.audio(audio_bytes, format="audio/mp3")
+    except Exception as e:
+        st.warning("⚠️ Drive から音源取得に失敗しました。")
+        st.caption(f"debug: drive_file_id={file_id} / error={e}")
+
+
+###############################################################################
+# Step1: Query
+###############################################################################
+guide("① まず、基準となる曲を聴いてください（30秒ほど推奨）。", st.session_state.get("phase") == 1)
+
+base_idx = int(st.session_state["base_idx"])
+base_row = meta.iloc[base_idx]
+
+st.subheader("🎵 基準曲 (Query Track)")
+title = str(base_row.get("title", "") or "")
+artist = str(base_row.get("artist", "") or "")
+if title or artist:
+    st.markdown(f"**{title}**  —  {artist}".strip())
+else:
+    st.markdown(f"**track_id={base_row.get('track_id', '')}**")
+
+play_by_meta_row(base_row)
+
+
+###############################################################################
+# Step2: Top5 Search (fixed)
+###############################################################################
+guide("② 聴き終えたら、下のボタンを押してください。", st.session_state.get("phase") == 2)
+
+run = st.button("🔎 この曲からTop5を表示", type="primary", disabled=(st.session_state.get("phase") < 2))
+
+if run:
+    q_vec = V[base_idx]
+    idx_arr, sim_arr = cosine_topk(V, q_vec, topk=TOPK_FIXED, exclude_idx=base_idx)
+
+    st.session_state["topk_idx"] = idx_arr
+    st.session_state["topk_sim"] = sim_arr
+    st.session_state["phase"] = 3
+    st.session_state["step3_time"] = time.time()
+
+    rng = st.session_state["rng"]
+    st.session_state["shuffle_order"] = rng.permutation(len(idx_arr))
+
+    st.rerun()
+
+
+###############################################################################
+# Step3: Show results (shuffled) + PCA map
+###############################################################################
+if st.session_state.get("topk_idx") is not None:
+    idx_arr = st.session_state["topk_idx"]
+    sim_arr = st.session_state["topk_sim"]
+    order = st.session_state.get("shuffle_order")
+
+    # true rank順（内部保持）
+    rows_true: List[dict] = []
+    for rank, (i_val, s_val) in enumerate(zip(idx_arr, sim_arr), start=1):
+        i_int = int(i_val)
+        r = meta.iloc[i_int]
+        rows_true.append({
+            "true_rank": rank,
+            "similarity": float(np.round(s_val, 6)),
+            "index": i_int,
+            "track_id": str(r.get("track_id", "")),
+            "title": str(r.get("title", "") or ""),
+            "artist": str(r.get("artist", "") or ""),
+        })
+
+    # 表示順シャッフル（A–E）
+    if order is not None:
+        rows_disp = [rows_true[i] for i in order]
+    else:
+        rows_disp = rows_true
+
+    letters = ["A", "B", "C", "D", "E"]  # ★常に5個
+
+    guide("③ 表示された5曲を聴いてください（表示順はランキング順ではありません）。", st.session_state.get("phase") == 3)
+
+    # 推薦地図（ズームアウト / 小さめ）
+    st.markdown("### 🗺️ 推薦地図（PCA 2D）")
+    st.caption("★ が基準曲です。数字は（ランキング順の）1〜5です。")
+    try:
+        X_map = np.vstack([V[base_idx][None, :], V[idx_arr]])
+        Z_map = pca2d_svd(X_map)
+        Z_map = Z_map - Z_map[0]  # queryを原点へ
+
+        fig, ax = plt.subplots(figsize=(3.2, 2.2), dpi=140)  # ★小さめ
+        ax.scatter(Z_map[1:, 0], Z_map[1:, 1], s=16)
+        ax.scatter([0], [0], s=70, marker="*")
+
+        for rnk, (xv, yv) in enumerate(Z_map[1:], start=1):
+            ax.text(xv, yv, str(rnk), fontsize=8)
+
+        # ★ズームアウト：表示範囲を広く固定（上空から見る感じ）
+        lim = float(np.max(np.abs(Z_map))) if Z_map.size else 1.0
+        lim = max(lim * 2.2, 0.5)  # 余白を大きめに
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+
+        ax.set_title("Recommendation Map (PCA 2D)", fontsize=9)
+        ax.grid(True, alpha=0.25)
+        ax.tick_params(labelsize=7)
+        st.pyplot(fig, clear_figure=True)
+    except Exception as e:
+        st.warning(f"PCA 地図の生成に失敗しました: {e}")
+
+    # Audio previews（シャッフル順）
+    st.markdown("### 🎧 推薦曲プレビュー（A〜E）")
+    for letter, r in zip(letters, rows_disp):
+        header = f"{letter}"
+        if r["title"]:
+            header += f": {r['title']}"
+        if r["artist"]:
+            header += f" — {r['artist']}"
+        st.markdown(f"**{header}**")
+        play_by_meta_row(meta.iloc[int(r["index"])])
+
+    # Prefilled URL（作成は1回だけ）
+    if st.session_state.get("prefilled_url") is None:
+        params: Dict[str, str] = {}
+
+        sid = st.session_state.get("session_id", "") or ""
+        assigned_genre = st.session_state.get("assigned_genre", "") or ""
+
+        # basic
+        params[FORM_ENTRY_IDS.get("session_id", "")] = sid
+        params[FORM_ENTRY_IDS.get("assigned_genre", "")] = assigned_genre
+        params[FORM_ENTRY_IDS.get("query_track_id", "")] = str(st.session_state.get("query_track_id", "") or "")
+
+        # true rank order（内部のランキング順で記録）
+        for pos, r in enumerate(rows_true, start=1):
+            params[FORM_ENTRY_IDS.get(f"rec_track_id_{pos}", "")] = str(r["track_id"])
+            params[FORM_ENTRY_IDS.get(f"true_rank_{pos}", "")] = str(r["true_rank"])
+            params[FORM_ENTRY_IDS.get(f"sim_{pos}", "")] = str(r["similarity"])
+
+        # shuffle positions（true rank -> 表示位置）
+        shuffle_pos_map: Dict[int, int] = {}
+        if order is not None:
+            for disp_pos, true_index in enumerate(order.tolist(), start=1):
+                shuffle_pos_map[true_index] = disp_pos
+        for pos in range(1, TOPK_FIXED + 1):
+            params[FORM_ENTRY_IDS.get(f"shuffle_pos_{pos}", "")] = str(shuffle_pos_map.get(pos - 1, pos))
+
+        prefilled_url_val = build_prefilled_form_url(GOOGLE_FORM_URL, params)
+        st.session_state["prefilled_url"] = prefilled_url_val
+
+        # ログ
+        try:
+            log_session_csv(sid, assigned_genre, time.time(), prefilled_url_val)
+        except Exception as e:
+            st.warning(f"ログ書き込みに失敗しました: {e}")
+
+    # Step4
+    guide("④ 最後にアンケート（Googleフォーム）に回答してください。", st.session_state.get("phase") == 4)
+
+    if st.session_state.get("phase") >= 4 and st.session_state.get("prefilled_url"):
+        st.link_button("✅ Googleフォームへ進む", st.session_state["prefilled_url"])
+
+        if not st.session_state.get("completed"):
+            if st.button("🎉 完了 (クリックして参加を完了)"):
+                # 二重完了ガード
+                counters = load_counters()
+                completed_ids = load_completed()
+                sid = st.session_state.get("session_id", "") or ""
+                g = st.session_state.get("assigned_genre", "") or ""
+
+                if sid and sid not in completed_ids:
+                    completed_ids.add(sid)
+                    counters[g] = int(counters.get(g, 0)) + 1
+                    try:
+                        save_counters(counters)
+                        save_completed(completed_ids)
+                    except Exception as e:
+                        st.warning(f"保存に失敗しました: {e}")
+
+                st.session_state["completed"] = True
+                st.success("ご参加ありがとうございました。回答が記録されました。ブラウザを閉じて構いません。")
+        else:
+            st.success("このセッションは既に完了しました。ありがとうございました！")
+
+else:
+    st.caption("※ まだ推薦を実行していません。上のボタンを押してください。")
