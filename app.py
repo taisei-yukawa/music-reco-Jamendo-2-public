@@ -3,13 +3,14 @@
 """
 Streamlit app for Jamendo-based Music Recommender (Experiment Version) - Drive Playback + pop reserve.
 
-改善反映（2026-xx-xx）:
+改善反映:
 - 起動時のサイドバーは閉じた状態にする
 - 被験者のバイアスを避けるため、画面上のジャンル表示は出さない（管理者用にのみ表示）
 - Top-Kは固定(5)にし、被験者が触れないようにする
 - ガイド文言を「評価」→「聴いてください」へ変更（順位提示しない前提）
 - Top5表（DataFrame）表示を削除
-- 推薦地図(PCA)を小さく＋ズームアウト（上空から）表示
+- 推薦地図(PCA)を小さく＋ズームアウト表示
+- ★修正：Top5ボタンは“いつでも押せる”（待機時間ゲート撤廃）
 
 前提:
 - index/index_emb64_l2.npy
@@ -170,7 +171,6 @@ def new_session_id() -> str:
     return uuid.uuid4().hex
 
 def assign_genre_pop_reserve(counters: Dict[str, int]) -> Optional[str]:
-    # 順番指定でprimaryを埋める→満員ならpopへ
     for g in PRIMARY_ORDER:
         if counters.get(g, 0) < PRIMARY_LIMIT:
             return g
@@ -356,8 +356,8 @@ if "initialised" not in st.session_state:
 
         st.session_state["base_idx"] = base_idx
 
+        # phase: 1=案内 / 3=結果表示 / 4=フォーム誘導
         st.session_state["phase"] = 1
-        st.session_state["init_time"] = time.time()
         st.session_state["step3_time"] = None
 
         st.session_state["rng"] = np.random.default_rng(RANDOM_SEED)
@@ -383,10 +383,8 @@ with st.sidebar:
         st.write(f"Session ID: {st.session_state.get('session_id')}")
         st.write(f"Query track_id: {st.session_state.get('query_track_id')}")
 
-# Phase update by time
+# Phase update (ゲート撤廃：ボタンは常に押せるが、フォーム誘導はTop5後に進める)
 now = time.time()
-if st.session_state.get("phase") == 1 and now - st.session_state.get("init_time", 0) >= 15:
-    st.session_state["phase"] = 2
 if st.session_state.get("phase") == 3 and st.session_state.get("step3_time") is not None:
     if now - st.session_state["step3_time"] >= 20:
         st.session_state["phase"] = 4
@@ -396,9 +394,6 @@ if st.session_state.get("phase") == 3 and st.session_state.get("step3_time") is 
 # Playback helper
 ###############################################################################
 def play_by_meta_row(row: pd.Series, label: str = "") -> None:
-    """
-    meta行の drive_file_id からダウンロード→st.audio で再生する。
-    """
     file_id = str(row.get("drive_file_id", "") or "").strip()
     if not file_id:
         st.warning("⚠️ 音源が再生できません（drive_file_id が空です）。")
@@ -416,7 +411,7 @@ def play_by_meta_row(row: pd.Series, label: str = "") -> None:
 ###############################################################################
 # Step1: Query
 ###############################################################################
-guide("① まず、基準となる曲を聴いてください（30秒ほど推奨）。", st.session_state.get("phase") == 1)
+guide("① まず、基準となる曲を聴いてください（30秒ほど推奨）。", st.session_state.get("phase") in (1,))
 
 base_idx = int(st.session_state["base_idx"])
 base_row = meta.iloc[base_idx]
@@ -431,13 +426,12 @@ else:
 
 play_by_meta_row(base_row)
 
-
 ###############################################################################
-# Step2: Top5 Search (fixed)
+# Step2: Top5 (いつでも押せる)
 ###############################################################################
-guide("② 聴き終えたら、下のボタンを押してください。", st.session_state.get("phase") == 2)
+guide("② いつでも押して Top5 を表示できます。", True)
 
-run = st.button("🔎 この曲からTop5を表示", type="primary", disabled=(st.session_state.get("phase") < 2))
+run = st.button("🔎 この曲からTop5を表示", type="primary")
 
 if run:
     q_vec = V[base_idx]
@@ -453,7 +447,6 @@ if run:
 
     st.rerun()
 
-
 ###############################################################################
 # Step3: Show results (shuffled) + PCA map
 ###############################################################################
@@ -462,7 +455,6 @@ if st.session_state.get("topk_idx") is not None:
     sim_arr = st.session_state["topk_sim"]
     order = st.session_state.get("shuffle_order")
 
-    # true rank順（内部保持）
     rows_true: List[dict] = []
     for rank, (i_val, s_val) in enumerate(zip(idx_arr, sim_arr), start=1):
         i_int = int(i_val)
@@ -476,34 +468,30 @@ if st.session_state.get("topk_idx") is not None:
             "artist": str(r.get("artist", "") or ""),
         })
 
-    # 表示順シャッフル（A–E）
     if order is not None:
         rows_disp = [rows_true[i] for i in order]
     else:
         rows_disp = rows_true
 
-    letters = ["A", "B", "C", "D", "E"]  # ★常に5個
+    letters = ["A", "B", "C", "D", "E"]
 
     guide("③ 表示された5曲を聴いてください（表示順はランキング順ではありません）。", st.session_state.get("phase") == 3)
 
-    # 推薦地図（ズームアウト / 小さめ）
     st.markdown("### 🗺️ 推薦地図（PCA 2D）")
     st.caption("★ が基準曲です。数字は（ランキング順の）1〜5です。")
     try:
         X_map = np.vstack([V[base_idx][None, :], V[idx_arr]])
         Z_map = pca2d_svd(X_map)
-        Z_map = Z_map - Z_map[0]  # queryを原点へ
+        Z_map = Z_map - Z_map[0]
 
-        fig, ax = plt.subplots(figsize=(3.2, 2.2), dpi=140)  # ★小さめ
+        fig, ax = plt.subplots(figsize=(3.2, 2.2), dpi=140)
         ax.scatter(Z_map[1:, 0], Z_map[1:, 1], s=16)
         ax.scatter([0], [0], s=70, marker="*")
-
         for rnk, (xv, yv) in enumerate(Z_map[1:], start=1):
             ax.text(xv, yv, str(rnk), fontsize=8)
 
-        # ★ズームアウト：表示範囲を広く固定（上空から見る感じ）
         lim = float(np.max(np.abs(Z_map))) if Z_map.size else 1.0
-        lim = max(lim * 2.2, 0.5)  # 余白を大きめに
+        lim = max(lim * 2.2, 0.5)
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
 
@@ -514,7 +502,6 @@ if st.session_state.get("topk_idx") is not None:
     except Exception as e:
         st.warning(f"PCA 地図の生成に失敗しました: {e}")
 
-    # Audio previews（シャッフル順）
     st.markdown("### 🎧 推薦曲プレビュー（A〜E）")
     for letter, r in zip(letters, rows_disp):
         header = f"{letter}"
@@ -525,25 +512,21 @@ if st.session_state.get("topk_idx") is not None:
         st.markdown(f"**{header}**")
         play_by_meta_row(meta.iloc[int(r["index"])])
 
-    # Prefilled URL（作成は1回だけ）
+    # Prefilled URL（1回だけ）
     if st.session_state.get("prefilled_url") is None:
         params: Dict[str, str] = {}
-
         sid = st.session_state.get("session_id", "") or ""
         assigned_genre = st.session_state.get("assigned_genre", "") or ""
 
-        # basic
         params[FORM_ENTRY_IDS.get("session_id", "")] = sid
         params[FORM_ENTRY_IDS.get("assigned_genre", "")] = assigned_genre
         params[FORM_ENTRY_IDS.get("query_track_id", "")] = str(st.session_state.get("query_track_id", "") or "")
 
-        # true rank order（内部のランキング順で記録）
         for pos, r in enumerate(rows_true, start=1):
             params[FORM_ENTRY_IDS.get(f"rec_track_id_{pos}", "")] = str(r["track_id"])
             params[FORM_ENTRY_IDS.get(f"true_rank_{pos}", "")] = str(r["true_rank"])
             params[FORM_ENTRY_IDS.get(f"sim_{pos}", "")] = str(r["similarity"])
 
-        # shuffle positions（true rank -> 表示位置）
         shuffle_pos_map: Dict[int, int] = {}
         if order is not None:
             for disp_pos, true_index in enumerate(order.tolist(), start=1):
@@ -554,7 +537,6 @@ if st.session_state.get("topk_idx") is not None:
         prefilled_url_val = build_prefilled_form_url(GOOGLE_FORM_URL, params)
         st.session_state["prefilled_url"] = prefilled_url_val
 
-        # ログ
         try:
             log_session_csv(sid, assigned_genre, time.time(), prefilled_url_val)
         except Exception as e:
@@ -568,7 +550,6 @@ if st.session_state.get("topk_idx") is not None:
 
         if not st.session_state.get("completed"):
             if st.button("🎉 完了 (クリックして参加を完了)"):
-                # 二重完了ガード
                 counters = load_counters()
                 completed_ids = load_completed()
                 sid = st.session_state.get("session_id", "") or ""
@@ -585,8 +566,9 @@ if st.session_state.get("topk_idx") is not None:
 
                 st.session_state["completed"] = True
                 st.success("ご参加ありがとうございました。回答が記録されました。ブラウザを閉じて構いません。")
+
         else:
             st.success("このセッションは既に完了しました。ありがとうございました！")
 
 else:
-    st.caption("※ まだ推薦を実行していません。上のボタンを押してください。")
+    st.caption("※ まだTop5を表示していません。上のボタンを押してください。")
