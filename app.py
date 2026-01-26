@@ -1,21 +1,20 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-Streamlit app for Jamendo-based Music Recommender (Experiment Version) - Drive Playback + pop reserve.
+Experiment App (Streamlit Community Cloud) - Drive Playback + pop reserve
 
-改善反映:
-- 起動時のサイドバーは閉じた状態にする
-- 被験者のバイアスを避けるため、画面上のジャンル表示は出さない（管理者用にのみ表示）
-- Top-Kは固定(5)にし、被験者が触れないようにする
-- ガイド文言を「評価」→「聴いてください」へ変更（順位提示しない前提）
-- Top5表（DataFrame）表示を削除
-- ★Top5ボタンは“いつでも押せる”（待機時間ゲート撤廃）
-- ★推薦地図（PCA）機能を削除
-- ★画面冒頭に「被験者がやること」説明文を表示
+仕様：
+- 音源は meta の drive_file_id を使って Google Drive からDLして再生（Cloud公開前提）
+- 4ジャンル(primary)は順番割当で各10人、満員後に pop(予備枠)を別枠で割当
+- TopKは固定5（被験者が変更できない）
+- Top5は表示順をシャッフルして A〜E で提示（ランキング順ではない）
+- Googleフォームへは prefilled URL で遷移
+- カウントは「完了ボタン」押下時のみ（フォームリンク押下ではカウントしない）
+- ★重要：20秒タイマーは削除（Top5表示後すぐにアンケートボタン＆完了ボタンを表示）
 
-前提:
+前提：
 - index/index_emb64_l2.npy
-- index/index_emb64_l2_meta.csv（drive_file_id 列を含む）
+- index/index_emb64_l2_meta.csv（drive_file_id列を含む）
 """
 
 from __future__ import annotations
@@ -31,7 +30,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ダウンロード用（requestsが無い環境でも動くようにフォールバック）
 try:
     import requests  # type: ignore
     _HAS_REQUESTS = True
@@ -49,17 +47,16 @@ INDEX_DIR = BASE_DIR / "index"
 EMB_NPY_NAME = "index_emb64_l2.npy"
 EMB_META_NAME = "index_emb64_l2_meta.csv"
 
-TOPK_FIXED = 5  # ★固定（変更不可）
+TOPK_FIXED = 5
 RANDOM_SEED = None
 
 GOOGLE_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLScGFzdmKsTP-nuGLWD_Awh7IHT7utFd5VCuu1Dc54PNTQY0Kw/viewform"
 
-# 割当ジャンル（popは予備枠）
 PRIMARY_GENRES: List[str] = ["classical", "jazz", "rock", "hiphop"]
 RESERVE_GENRE: str = "pop"
-PRIMARY_ORDER: List[str] = ["classical", "jazz", "rock", "hiphop"]  # 順番指定
+PRIMARY_ORDER: List[str] = ["classical", "jazz", "rock", "hiphop"]
 PRIMARY_LIMIT: int = 10
-POP_LIMIT: int = 10  # pop予備枠
+POP_LIMIT: int = 10
 
 # クエリ曲（track_id固定）
 QUERY_TRACKS: Dict[str, str] = {
@@ -70,12 +67,10 @@ QUERY_TRACKS: Dict[str, str] = {
     "pop": "1030923",
 }
 
-# 永続ファイル（Streamlit Cloudは再デプロイで消える可能性あり）
 COUNTERS_FILE = BASE_DIR / "genre_counter.json"
 LOG_FILE = BASE_DIR / "sessions_log.csv"
 COMPLETED_FILE = BASE_DIR / "completed_sessions.json"
 
-# Google Form entry IDs（あなたのフォームに合わせて置換）
 FORM_ENTRY_IDS: Dict[str, str] = {
     "session_id": "entry.1234567890",
     "assigned_genre": "entry.1234567891",
@@ -104,18 +99,13 @@ FORM_ENTRY_IDS: Dict[str, str] = {
 
 
 ###############################################################################
-# Utils: math
+# Helpers
 ###############################################################################
 def l2_unit(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     n = float(np.linalg.norm(x))
     return x / (n + eps)
 
-def cosine_topk(
-    V: np.ndarray,
-    q: np.ndarray,
-    topk: int,
-    exclude_idx: Optional[int] = None
-) -> Tuple[np.ndarray, np.ndarray]:
+def cosine_topk(V: np.ndarray, q: np.ndarray, topk: int, exclude_idx: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
     sims = V @ q
     if exclude_idx is not None and 0 <= exclude_idx < len(sims):
         sims[exclude_idx] = -1e9
@@ -130,7 +120,7 @@ def normalize_track_id(x: object) -> str:
 
 
 ###############################################################################
-# Utils: persistence
+# Persistence (counters / completed)
 ###############################################################################
 def _load_json(path: Path, default):
     try:
@@ -188,7 +178,7 @@ def log_session_csv(session_id: str, genre: str, ts: float, form_url: str) -> No
 
 
 ###############################################################################
-# Utils: Google Form prefill
+# Google Form prefill URL
 ###############################################################################
 def build_prefilled_form_url(base_url: str, entry_map: Dict[str, str]) -> str:
     from urllib.parse import urlencode
@@ -199,7 +189,7 @@ def build_prefilled_form_url(base_url: str, entry_map: Dict[str, str]) -> str:
 
 
 ###############################################################################
-# Utils: Google Drive download
+# Google Drive download
 ###############################################################################
 _CONFIRM_RE = re.compile(r"confirm=([0-9A-Za-z_]+)")
 
@@ -221,7 +211,6 @@ def _download_bytes_via_requests(url: str, timeout: int = 30) -> bytes:
             r2 = sess.get(url2, stream=True, timeout=timeout)
             r2.raise_for_status()
             return r2.content
-
     return r.content
 
 def _download_bytes_via_urllib(url: str, timeout: int = 30) -> bytes:
@@ -262,12 +251,7 @@ def load_assets() -> Tuple[np.ndarray, pd.DataFrame, Dict[str, int]]:
         raise ValueError("meta に drive_file_id 列がありません。drive_file_id付きmetaに差し替えてください。")
 
     V = np.stack([l2_unit(v) for v in V], axis=0)
-
-    info = {
-        "index_rows": int(len(V)),
-        "dim": int(V.shape[1]) if len(V) > 0 else 0,
-        "has_requests": int(_HAS_REQUESTS),
-    }
+    info = {"index_rows": int(len(V)), "dim": int(V.shape[1]) if len(V) > 0 else 0, "has_requests": int(_HAS_REQUESTS)}
     return V, meta, info
 
 
@@ -282,11 +266,10 @@ st.set_page_config(
 
 st.title("🎧 Music Recommender – Experiment (Drive Playback / pop reserve)")
 
-# guide CSS
+# Guide CSS
 st.markdown(
     """
 <style>
-@keyframes blink { 0%{opacity:1;} 50%{opacity:0.25;} 100%{opacity:1;} }
 .guide {
   padding: 10px 12px;
   border-radius: 12px;
@@ -294,15 +277,14 @@ st.markdown(
   border: 1px solid rgba(0,0,0,0.08);
   margin: 4px 0 8px 0;
 }
-.blink { animation: blink 1.0s infinite; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-def guide(text: str, active: bool) -> None:
-    cls = "guide blink" if active else "guide"
-    st.markdown(f"<div class='{cls}'>{text}</div>", unsafe_allow_html=True)
+def guide(text: str) -> None:
+    st.markdown(f"<div class='guide'>{text}</div>", unsafe_allow_html=True)
+
 
 # Load
 try:
@@ -315,14 +297,14 @@ if len(V) == 0:
     st.error("インデックスが空です。")
     st.stop()
 
-# --- 画面冒頭：被験者向け説明（バイアスが出ない内容）
+# --- 被験者向け冒頭説明（バイアスが出ない内容）
 st.markdown(
     """
 ### このページで行うこと
 1. **基準曲（最初の曲）**を再生して聴いてください。  
-2. 下のボタン **「🔎 この曲から5つの楽曲を表示」** を押してください。  
+2. ボタン **「🔎 この曲から5つの楽曲を表示」** を押してください。  
 3. 表示された **A〜E の5曲**を順に聴いてください（表示順はランキング順ではありません）。  
-4. 画面下部の **Googleフォーム** に回答し、最後に **「完了」ボタン**を押してください。  
+4. 表示される **Googleフォーム** に回答し、最後に **「完了」ボタン**を押してください。  
 
 ※ 途中でブラウザを閉じた場合、カウントされません（「完了」ボタン押下時のみ記録されます）。
 """
@@ -333,9 +315,8 @@ if "initialised" not in st.session_state:
     st.session_state["initialised"] = True
 
     counters = load_counters()
-    completed = load_completed()
-
     assigned = assign_genre_pop_reserve(counters)
+
     if assigned is None:
         st.session_state["closed"] = True
         st.session_state["assigned_genre"] = None
@@ -363,12 +344,6 @@ if "initialised" not in st.session_state:
 
         st.session_state["base_idx"] = base_idx
 
-        # phase: 1=案内 / 3=結果表示 / 4=フォーム誘導
-        st.session_state["phase"] = 1
-        st.session_state["step3_time"] = None
-
-        st.session_state["rng"] = np.random.default_rng(RANDOM_SEED)
-
         st.session_state["topk_idx"] = None
         st.session_state["topk_sim"] = None
         st.session_state["shuffle_order"] = None
@@ -390,12 +365,6 @@ with st.sidebar:
         st.write(f"Session ID: {st.session_state.get('session_id')}")
         st.write(f"Query track_id: {st.session_state.get('query_track_id')}")
 
-# Phase update（フォーム誘導のみタイマー）
-now = time.time()
-if st.session_state.get("phase") == 3 and st.session_state.get("step3_time") is not None:
-    if now - st.session_state["step3_time"] >= 20:
-        st.session_state["phase"] = 4
-
 
 ###############################################################################
 # Playback helper
@@ -416,7 +385,7 @@ def play_by_meta_row(row: pd.Series) -> None:
 ###############################################################################
 # Step1: Query
 ###############################################################################
-guide("① まず、基準となる曲を聴いてください（30秒ほど推奨）。", st.session_state.get("phase") in (1,))
+guide("① まず、基準となる曲を聴いてください。")
 
 base_idx = int(st.session_state["base_idx"])
 base_row = meta.iloc[base_idx]
@@ -442,16 +411,16 @@ if run:
 
     st.session_state["topk_idx"] = idx_arr
     st.session_state["topk_sim"] = sim_arr
-    st.session_state["phase"] = 3
-    st.session_state["step3_time"] = time.time()
 
-    rng = st.session_state["rng"]
+    rng = np.random.default_rng(RANDOM_SEED)
     st.session_state["shuffle_order"] = rng.permutation(len(idx_arr))
 
+    # Top5が出たら、アンケート表示を有効化
+    st.session_state["prefilled_url"] = None
     st.rerun()
 
 ###############################################################################
-# Step3: Show results (shuffled)
+# Step3: Show results (shuffled) + show form immediately
 ###############################################################################
 if st.session_state.get("topk_idx") is not None:
     idx_arr = st.session_state["topk_idx"]
@@ -478,7 +447,7 @@ if st.session_state.get("topk_idx") is not None:
 
     letters = ["A", "B", "C", "D", "E"]
 
-    guide("③ 表示された5曲を聴いてください。", st.session_state.get("phase") == 3)
+    guide("②’ 表示された5曲（A〜E）を聴いてください（表示順はランキング順ではありません）。")
 
     st.markdown("### 🎧 推薦曲プレビュー（A〜E）")
     for letter, r in zip(letters, rows_disp):
@@ -490,7 +459,7 @@ if st.session_state.get("topk_idx") is not None:
         st.markdown(f"**{header}**")
         play_by_meta_row(meta.iloc[int(r["index"])])
 
-    # Prefilled URL（1回だけ）
+    # Prefilled URL（Top5があるなら即作る）
     if st.session_state.get("prefilled_url") is None:
         params: Dict[str, str] = {}
         sid = st.session_state.get("session_id", "") or ""
@@ -520,10 +489,10 @@ if st.session_state.get("topk_idx") is not None:
         except Exception as e:
             st.warning(f"ログ書き込みに失敗しました: {e}")
 
-    # Step4
-    guide("④ 最後にアンケート（Googleフォーム）に回答してください。", st.session_state.get("phase") == 4)
+    # Form & Complete (即表示)
+    guide("③ アンケート（Googleフォーム）に回答し、最後に「完了」ボタンを押してください。")
 
-    if st.session_state.get("phase") >= 4 and st.session_state.get("prefilled_url"):
+    if st.session_state.get("prefilled_url"):
         st.link_button("✅ Googleフォームへ進む", st.session_state["prefilled_url"])
 
         if not st.session_state.get("completed"):
@@ -533,6 +502,7 @@ if st.session_state.get("topk_idx") is not None:
                 sid = st.session_state.get("session_id", "") or ""
                 g = st.session_state.get("assigned_genre", "") or ""
 
+                # 二重加算防止
                 if sid and sid not in completed_ids:
                     completed_ids.add(sid)
                     counters[g] = int(counters.get(g, 0)) + 1
@@ -544,7 +514,6 @@ if st.session_state.get("topk_idx") is not None:
 
                 st.session_state["completed"] = True
                 st.success("ご参加ありがとうございました。回答が記録されました。ブラウザを閉じて構いません。")
-
         else:
             st.success("このセッションは既に完了しました。ありがとうございました！")
 
