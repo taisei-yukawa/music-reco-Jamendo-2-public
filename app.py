@@ -344,7 +344,6 @@ if "initialised" not in st.session_state:
                 base_idx = int(np.argmax(mask.values))
 
         if base_idx is None:
-            # 見つからない場合はランダム（実験では避けたい）
             rng_tmp = np.random.default_rng(RANDOM_SEED)
             base_idx = int(rng_tmp.integers(0, len(V)))
             st.session_state["query_track_id"] = str(meta.loc[base_idx].get("track_id", ""))
@@ -377,4 +376,13 @@ with st.sidebar:
         st.write(f"Assigned genre: {st.session_state.get('assigned_genre')}")
         st.write(f"Session ID: {st.session_state.get('session_id')}")
         st.write(f"Query track_id: {st.session_state.get('query_track_id')}")
-        st.wri
+
+        st.write("---")
+        c = load_counters()
+        st.write("Completed counters:")
+        for g in PRIMARY_GENRES + [RESERVE_GENRE]:
+            limit = PRIMARY_LIMIT if g in PRIMARY_GENRES else POP_LIMIT
+            st.write(f"- {g}: {c.get(g,0)}/{limit}")
+
+# 以降（Step1〜）はあなたの現行続きがあるはずなので、
+# この下に元のStep1/Step2/Step3/Step4部分をそのまま続けてください。
