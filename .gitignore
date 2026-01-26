@@ -1,0 +1,24 @@
+# BIG FILES (絶対pushしない)
+audio/
+*.mp3
+*.wav
+*.flac
+*.zip
+*.7z
+
+# runtime artifacts
+genre_counter.json
+completed_sessions.json
+sessions_log.csv
+token.json
+drive_audio_map.csv
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# OS
+Thumbs.db
+.DS_Store
