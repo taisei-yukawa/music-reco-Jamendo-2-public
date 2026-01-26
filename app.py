@@ -9,8 +9,9 @@ Streamlit app for Jamendo-based Music Recommender (Experiment Version) - Drive P
 - Top-Kは固定(5)にし、被験者が触れないようにする
 - ガイド文言を「評価」→「聴いてください」へ変更（順位提示しない前提）
 - Top5表（DataFrame）表示を削除
-- 推薦地図(PCA)を小さく＋ズームアウト表示
-- ★修正：Top5ボタンは“いつでも押せる”（待機時間ゲート撤廃）
+- ★Top5ボタンは“いつでも押せる”（待機時間ゲート撤廃）
+- ★推薦地図（PCA）機能を削除
+- ★画面冒頭に「被験者がやること」説明文を表示
 
 前提:
 - index/index_emb64_l2.npy
@@ -28,7 +29,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
 
 # ダウンロード用（requestsが無い環境でも動くようにフォールバック）
@@ -104,7 +104,7 @@ FORM_ENTRY_IDS: Dict[str, str] = {
 
 
 ###############################################################################
-# Utils: math / PCA
+# Utils: math
 ###############################################################################
 def l2_unit(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     n = float(np.linalg.norm(x))
@@ -122,11 +122,6 @@ def cosine_topk(
     idx = np.argsort(-sims)[:topk]
     return idx, sims[idx]
 
-def pca2d_svd(X: np.ndarray) -> np.ndarray:
-    Xc = X - X.mean(axis=0, keepdims=True)
-    _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
-    return Xc @ Vt[:2].T
-
 def normalize_track_id(x: object) -> str:
     if x is None:
         return ""
@@ -135,7 +130,7 @@ def normalize_track_id(x: object) -> str:
 
 
 ###############################################################################
-# Utils: persistence (counters, completed)
+# Utils: persistence
 ###############################################################################
 def _load_json(path: Path, default):
     try:
@@ -282,12 +277,12 @@ def load_assets() -> Tuple[np.ndarray, pd.DataFrame, Dict[str, int]]:
 st.set_page_config(
     page_title="Music Recommender (Experiment)",
     layout="wide",
-    initial_sidebar_state="collapsed",  # ★サイドバーを閉じた状態で起動
+    initial_sidebar_state="collapsed",
 )
 
 st.title("🎧 Music Recommender – Experiment (Drive Playback / pop reserve)")
 
-# CSS for guide
+# guide CSS
 st.markdown(
     """
 <style>
@@ -320,6 +315,19 @@ if len(V) == 0:
     st.error("インデックスが空です。")
     st.stop()
 
+# --- 画面冒頭：被験者向け説明（バイアスが出ない内容）
+st.markdown(
+    """
+### このページで行うこと
+1. **基準曲（最初の曲）**を再生して聴いてください。  
+2. 下のボタン **「🔎 この曲から5つの楽曲を表示」** を押してください。  
+3. 表示された **A〜E の5曲**を順に聴いてください（表示順はランキング順ではありません）。  
+4. 画面下部の **Googleフォーム** に回答し、最後に **「完了」ボタン**を押してください。  
+
+※ 途中でブラウザを閉じた場合、カウントされません（「完了」ボタン押下時のみ記録されます）。
+"""
+)
+
 # Session init
 if "initialised" not in st.session_state:
     st.session_state["initialised"] = True
@@ -349,7 +357,6 @@ if "initialised" not in st.session_state:
                 base_idx = int(np.argmax(mask.values))
 
         if base_idx is None:
-            # 見つからない場合はランダム（実験では避けたい）
             rng_tmp = np.random.default_rng(RANDOM_SEED)
             base_idx = int(rng_tmp.integers(0, len(V)))
             st.session_state["query_track_id"] = str(meta.loc[base_idx].get("track_id", ""))
@@ -372,7 +379,7 @@ if st.session_state.get("closed"):
     st.error("全ジャンルが満員です（実験終了）。")
     st.stop()
 
-# Sidebar（管理者用：expanderで閉じた状態）
+# Sidebar（管理者用）
 with st.sidebar:
     with st.expander("管理者情報（クリックで展開）", expanded=False):
         st.write(f"Index rows: {info['index_rows']}")
@@ -383,7 +390,7 @@ with st.sidebar:
         st.write(f"Session ID: {st.session_state.get('session_id')}")
         st.write(f"Query track_id: {st.session_state.get('query_track_id')}")
 
-# Phase update (ゲート撤廃：ボタンは常に押せるが、フォーム誘導はTop5後に進める)
+# Phase update（フォーム誘導のみタイマー）
 now = time.time()
 if st.session_state.get("phase") == 3 and st.session_state.get("step3_time") is not None:
     if now - st.session_state["step3_time"] >= 20:
@@ -393,15 +400,13 @@ if st.session_state.get("phase") == 3 and st.session_state.get("step3_time") is 
 ###############################################################################
 # Playback helper
 ###############################################################################
-def play_by_meta_row(row: pd.Series, label: str = "") -> None:
+def play_by_meta_row(row: pd.Series) -> None:
     file_id = str(row.get("drive_file_id", "") or "").strip()
     if not file_id:
         st.warning("⚠️ 音源が再生できません（drive_file_id が空です）。")
         return
     try:
         audio_bytes = download_mp3_bytes_from_drive(file_id)
-        if label:
-            st.caption(label)
         st.audio(audio_bytes, format="audio/mp3")
     except Exception as e:
         st.warning("⚠️ Drive から音源取得に失敗しました。")
@@ -429,9 +434,7 @@ play_by_meta_row(base_row)
 ###############################################################################
 # Step2: Top5 (いつでも押せる)
 ###############################################################################
-guide("② いつでも押して Top5 を表示できます。", True)
-
-run = st.button("🔎 この曲からTop5を表示", type="primary")
+run = st.button("🔎 この曲から5つの楽曲を表示", type="primary")
 
 if run:
     q_vec = V[base_idx]
@@ -448,7 +451,7 @@ if run:
     st.rerun()
 
 ###############################################################################
-# Step3: Show results (shuffled) + PCA map
+# Step3: Show results (shuffled)
 ###############################################################################
 if st.session_state.get("topk_idx") is not None:
     idx_arr = st.session_state["topk_idx"]
@@ -475,32 +478,7 @@ if st.session_state.get("topk_idx") is not None:
 
     letters = ["A", "B", "C", "D", "E"]
 
-    guide("③ 表示された5曲を聴いてください（表示順はランキング順ではありません）。", st.session_state.get("phase") == 3)
-
-    st.markdown("### 🗺️ 推薦地図（PCA 2D）")
-    st.caption("★ が基準曲です。数字は（ランキング順の）1〜5です。")
-    try:
-        X_map = np.vstack([V[base_idx][None, :], V[idx_arr]])
-        Z_map = pca2d_svd(X_map)
-        Z_map = Z_map - Z_map[0]
-
-        fig, ax = plt.subplots(figsize=(3.2, 2.2), dpi=140)
-        ax.scatter(Z_map[1:, 0], Z_map[1:, 1], s=16)
-        ax.scatter([0], [0], s=70, marker="*")
-        for rnk, (xv, yv) in enumerate(Z_map[1:], start=1):
-            ax.text(xv, yv, str(rnk), fontsize=8)
-
-        lim = float(np.max(np.abs(Z_map))) if Z_map.size else 1.0
-        lim = max(lim * 2.2, 0.5)
-        ax.set_xlim(-lim, lim)
-        ax.set_ylim(-lim, lim)
-
-        ax.set_title("Recommendation Map (PCA 2D)", fontsize=9)
-        ax.grid(True, alpha=0.25)
-        ax.tick_params(labelsize=7)
-        st.pyplot(fig, clear_figure=True)
-    except Exception as e:
-        st.warning(f"PCA 地図の生成に失敗しました: {e}")
+    guide("③ 表示された5曲を聴いてください。", st.session_state.get("phase") == 3)
 
     st.markdown("### 🎧 推薦曲プレビュー（A〜E）")
     for letter, r in zip(letters, rows_disp):
