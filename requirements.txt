@@ -1,8 +1,4 @@
-streamlit==1.41.1
 numpy==1.26.4
-pandas==2.2.3
-matplotlib==3.9.2
-requests==2.32.3
-scipy==1.13.1
-gspread==6.1.4
-google-auth==2.34.0
+pandas
+streamlit
+requests
