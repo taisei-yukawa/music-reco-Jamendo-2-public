@@ -97,7 +97,12 @@ def l2_unit(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     n = float(np.linalg.norm(x))
     return x / (n + eps)
 
-def cosine_topk(V: np.ndarray, q: np.ndarray, topk: int, exclude_idx: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+def cosine_topk(
+    V: np.ndarray,
+    q: np.ndarray,
+    topk: int,
+    exclude_idx: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray]:
     sims = V @ q
     if exclude_idx is not None and 0 <= exclude_idx < len(sims):
         sims[exclude_idx] = -1e9
@@ -174,7 +179,7 @@ def append_session_log_local(session_id: str, assigned_genre: str, query_track_i
 # Response schema (shared)
 ###############################################################################
 def response_schema_columns() -> List[str]:
-    cols = []
+    cols: List[str] = []
     cols += ["timestamp", "session_id", "assigned_genre", "query_track_id"]
     cols += ["music_hours_per_day", "age", "gender"]
     cols += ["A_track_id", "B_track_id", "C_track_id", "D_track_id", "E_track_id"]
@@ -199,7 +204,7 @@ def append_response_row_local(row: Dict[str, object]) -> None:
 
 
 ###############################################################################
-# Google Sheets backend (GCP_SA_JSON 対応) + DEBUG
+# Google Sheets backend (GCP_SA_JSON 対応)
 ###############################################################################
 def using_sheets_backend() -> bool:
     return (
@@ -208,43 +213,25 @@ def using_sheets_backend() -> bool:
         ("GCP_SA_JSON" in st.secrets)
     )
 
-def _mask(s: str, keep: int = 6) -> str:
-    if not s:
-        return ""
-    if len(s) <= keep:
-        return s
-    return s[:keep] + "..." + s[-keep:]
-
 @st.cache_resource(show_spinner=False)
 def get_gspread_client() -> "gspread.Client":
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    # 安全側でDriveも含める（open_by_key等で要求される場合がある）
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
 
     sa_json_str = st.secrets["GCP_SA_JSON"]
-
-    # ---- DEBUG 1: JSON parse ----
     sa_info = json.loads(sa_json_str)
-
-    # ---- DEBUG 2: key sanity ----
-    client_email = str(sa_info.get("client_email", ""))
-    project_id = str(sa_info.get("project_id", ""))
-    private_key = str(sa_info.get("private_key", ""))
-
-    st.write("DEBUG[Sheets] project_id:", project_id)
-    st.write("DEBUG[Sheets] client_email:", client_email)
-    st.write("DEBUG[Sheets] private_key length:", len(private_key))
-    st.write("DEBUG[Sheets] private_key head:", private_key[:30])
-    st.write("DEBUG[Sheets] private_key tail(masked):", _mask(private_key[-40:], keep=10))
 
     creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
     return gspread.authorize(creds)
 
 def get_sheet() -> "gspread.Spreadsheet":
     sheet_id = st.secrets["SHEET_ID"]
-    st.write("DEBUG[Sheets] SHEET_ID:", sheet_id)  # DEBUG
     return get_gspread_client().open_by_key(sheet_id)
 
 def ws(name: str) -> "gspread.Worksheet":
-    st.write("DEBUG[Sheets] open worksheet:", name)  # DEBUG
     return get_sheet().worksheet(name)
 
 def ensure_sheet_headers():
@@ -252,7 +239,7 @@ def ensure_sheet_headers():
     wss = ws("sessions")
 
     resp_cols = response_schema_columns()
-    sess_cols = ["timestamp", "session_id", "status", "assigned_genre", "query_track_id"]
+    sess_cols = ["timestamp", "session_id", "status", "assigned_genre", "query_track_id"]  # reserved/completed
 
     vals = wsr.get_all_values()
     if not vals:
@@ -300,7 +287,7 @@ def mark_completed_sheets(session_id: str) -> None:
     cell = wss.find(session_id)
     if cell is None:
         return
-    wss.update_cell(cell.row, 3, "completed")
+    wss.update_cell(cell.row, 3, "completed")  # status列
 
 def is_completed_sheets(session_id: str) -> bool:
     wss = ws("sessions")
@@ -404,9 +391,8 @@ USE_SHEETS = using_sheets_backend()
 if USE_SHEETS:
     try:
         ensure_sheet_headers()
-    except Exception as e:
-        st.error("Google Sheets への接続に失敗しました。Secrets / Sheet共有設定を確認してください。")
-        st.caption(f"debug: {type(e).__name__}: {e}")
+    except Exception:
+        st.error("Google Sheets への接続に失敗しました。時間をおいて再読み込みしてください。")
         st.stop()
 
 # Sidebar admin
