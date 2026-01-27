@@ -1,24 +1,20 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-Experiment App (Streamlit Community Cloud) - Drive Playback + pop reserve
+Experiment App (Streamlit local/Community Cloud) - Drive Playback + pop reserve + Built-in Questionnaire
 
-仕様：
-- 音源は meta の drive_file_id を使って Google Drive からDLして再生（Cloud公開前提）
-- 4ジャンル(primary)は順番割当で各10人、満員後に pop(予備枠)を別枠で割当
-- TopKは固定5（被験者が変更できない）
-- Top5は表示順をシャッフルして A〜E で提示（ランキング順ではない）
-- Googleフォームへは prefilled URL で遷移
-- カウントは「完了ボタン」押下時のみ（フォームリンク押下ではカウントしない）
-- ★重要：20秒タイマーは削除（Top5表示後すぐにアンケートボタン＆完了ボタンを表示）
+UIは維持したまま、保存先だけを自動切替：
+- ローカル（Secretsなし）: CSV + json（従来どおり）
+- Streamlit Community Cloud（Secretsあり）: Google Sheets（responses/sessions）
 
-前提：
-- index/index_emb64_l2.npy
-- index/index_emb64_l2_meta.csv（drive_file_id列を含む）
+★追加（表示のみ）:
+- 基準曲の再生の上に「30秒程度推奨」
+- 推薦曲の再生のところに「15秒ほど推奨」
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 import time
@@ -37,6 +33,14 @@ except Exception:
     _HAS_REQUESTS = False
     import urllib.request
 
+# Sheets用（Secretsがあるときだけ使う）
+try:
+    import gspread  # type: ignore
+    from google.oauth2.service_account import Credentials  # type: ignore
+    _HAS_SHEETS_LIBS = True
+except Exception:
+    _HAS_SHEETS_LIBS = False
+
 
 ###############################################################################
 # CONFIG
@@ -47,10 +51,13 @@ INDEX_DIR = BASE_DIR / "index"
 EMB_NPY_NAME = "index_emb64_l2.npy"
 EMB_META_NAME = "index_emb64_l2_meta.csv"
 
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RESPONSES_CSV = DATA_DIR / "responses.csv"
+SESSIONS_LOG_CSV = DATA_DIR / "sessions_log.csv"
+
 TOPK_FIXED = 5
 RANDOM_SEED = None
-
-GOOGLE_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLScGFzdmKsTP-nuGLWD_Awh7IHT7utFd5VCuu1Dc54PNTQY0Kw/viewform"
 
 PRIMARY_GENRES: List[str] = ["classical", "jazz", "rock", "hiphop"]
 RESERVE_GENRE: str = "pop"
@@ -58,7 +65,6 @@ PRIMARY_ORDER: List[str] = ["classical", "jazz", "rock", "hiphop"]
 PRIMARY_LIMIT: int = 10
 POP_LIMIT: int = 10
 
-# クエリ曲（track_id固定）
 QUERY_TRACKS: Dict[str, str] = {
     "classical": "1077954",
     "jazz": "1069786",
@@ -67,35 +73,22 @@ QUERY_TRACKS: Dict[str, str] = {
     "pop": "1030923",
 }
 
+# ローカル用
 COUNTERS_FILE = BASE_DIR / "genre_counter.json"
-LOG_FILE = BASE_DIR / "sessions_log.csv"
 COMPLETED_FILE = BASE_DIR / "completed_sessions.json"
 
-FORM_ENTRY_IDS: Dict[str, str] = {
-    "session_id": "entry.1234567890",
-    "assigned_genre": "entry.1234567891",
-    "query_track_id": "entry.1234567892",
-    "rec_track_id_1": "entry.1234567893",
-    "rec_track_id_2": "entry.1234567894",
-    "rec_track_id_3": "entry.1234567895",
-    "rec_track_id_4": "entry.1234567896",
-    "rec_track_id_5": "entry.1234567897",
-    "true_rank_1": "entry.1234567898",
-    "true_rank_2": "entry.1234567899",
-    "true_rank_3": "entry.1234567900",
-    "true_rank_4": "entry.1234567901",
-    "true_rank_5": "entry.1234567902",
-    "sim_1": "entry.1234567903",
-    "sim_2": "entry.1234567904",
-    "sim_3": "entry.1234567905",
-    "sim_4": "entry.1234567906",
-    "sim_5": "entry.1234567907",
-    "shuffle_pos_1": "entry.1234567908",
-    "shuffle_pos_2": "entry.1234567909",
-    "shuffle_pos_3": "entry.1234567910",
-    "shuffle_pos_4": "entry.1234567911",
-    "shuffle_pos_5": "entry.1234567912",
-}
+LETTERS = ["A", "B", "C", "D", "E"]
+FEATURES = ["tempo", "rhythm", "vocal", "melody", "genre_sim"]
+
+LIKERT_MIN = 1
+LIKERT_MAX = 5
+
+MUSIC_HOURS_OPTIONS = ["全く聴かない", "３０分未満", "１時間", "２時間以上"]
+AGE_GROUP_OPTIONS = ["１０代", "２０代", "３０代", "４０代以上"]
+GENDER_OPTIONS = ["未回答", "男性", "女性", "その他", "回答しない"]
+
+# Cloud同時アクセスで枠が塞がり続けないように「予約」の有効期限を入れる
+RESERVATION_TTL_SEC = 60 * 60  # 1時間
 
 
 ###############################################################################
@@ -115,12 +108,14 @@ def cosine_topk(V: np.ndarray, q: np.ndarray, topk: int, exclude_idx: Optional[i
 def normalize_track_id(x: object) -> str:
     if x is None:
         return ""
-    s = str(x).strip()
-    return Path(s).stem
+    return Path(str(x).strip()).stem
+
+def new_session_id() -> str:
+    return uuid.uuid4().hex
 
 
 ###############################################################################
-# Persistence (counters / completed)
+# Local persistence (json/csv)
 ###############################################################################
 def _load_json(path: Path, default):
     try:
@@ -136,63 +131,179 @@ def _save_json_atomic(path: Path, obj) -> None:
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
 
-def load_counters() -> Dict[str, int]:
+def load_counters_local() -> Dict[str, int]:
     data = _load_json(COUNTERS_FILE, default={})
     for g in PRIMARY_GENRES + [RESERVE_GENRE]:
         data[g] = int(data.get(g, 0))
     return data
 
-def save_counters(counters: Dict[str, int]) -> None:
+def save_counters_local(counters: Dict[str, int]) -> None:
     _save_json_atomic(COUNTERS_FILE, counters)
 
-def load_completed() -> set[str]:
+def load_completed_local() -> set[str]:
     data = _load_json(COMPLETED_FILE, default={"completed": []})
     return set(data.get("completed", []))
 
-def save_completed(completed: set[str]) -> None:
+def save_completed_local(completed: set[str]) -> None:
     _save_json_atomic(COMPLETED_FILE, {"completed": sorted(list(completed))})
 
-def new_session_id() -> str:
-    return uuid.uuid4().hex
-
-def assign_genre_pop_reserve(counters: Dict[str, int]) -> Optional[str]:
+def assign_genre_pop_reserve_from_counts(counts: Dict[str, int]) -> Optional[str]:
     for g in PRIMARY_ORDER:
-        if counters.get(g, 0) < PRIMARY_LIMIT:
+        if counts.get(g, 0) < PRIMARY_LIMIT:
             return g
-    if counters.get(RESERVE_GENRE, 0) < POP_LIMIT:
+    if counts.get(RESERVE_GENRE, 0) < POP_LIMIT:
         return RESERVE_GENRE
     return None
 
-def log_session_csv(session_id: str, genre: str, ts: float, form_url: str) -> None:
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    row = pd.DataFrame([{
-        "timestamp": int(ts),
+def append_session_log_local(session_id: str, assigned_genre: str, query_track_id: str) -> None:
+    SESSIONS_LOG_CSV.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "timestamp": int(time.time()),
         "session_id": session_id,
-        "assigned_genre": genre,
-        "form_url": form_url,
-    }])
-    if LOG_FILE.exists():
-        row.to_csv(LOG_FILE, mode="a", header=False, index=False, encoding="utf-8-sig")
+        "assigned_genre": assigned_genre,
+        "query_track_id": query_track_id,
+    }
+    write_header = not SESSIONS_LOG_CSV.exists()
+    with SESSIONS_LOG_CSV.open("a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+
+###############################################################################
+# Response schema (shared)
+###############################################################################
+def response_schema_columns() -> List[str]:
+    cols = []
+    cols += ["timestamp", "session_id", "assigned_genre", "query_track_id"]
+    cols += ["music_hours_per_day", "age", "gender"]
+    cols += ["A_track_id", "B_track_id", "C_track_id", "D_track_id", "E_track_id"]
+    cols += ["A_true_rank", "B_true_rank", "C_true_rank", "D_true_rank", "E_true_rank"]
+    cols += ["A_sim", "B_sim", "C_sim", "D_sim", "E_sim"]
+    cols += ["rank_A", "rank_B", "rank_C", "rank_D", "rank_E"]
+    for L in LETTERS:
+        for feat in FEATURES:
+            cols.append(f"{L}_{feat}")
+    cols += ["usability", "ui_visibility", "free_comment"]
+    return cols
+
+def append_response_row_local(row: Dict[str, object]) -> None:
+    cols = response_schema_columns()
+    write_header = not RESPONSES_CSV.exists()
+    with RESPONSES_CSV.open("a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        if write_header:
+            w.writeheader()
+        out = {c: row.get(c, "") for c in cols}
+        w.writerow(out)
+
+
+###############################################################################
+# Google Sheets backend
+###############################################################################
+def using_sheets_backend() -> bool:
+    # Secretsがある＋ライブラリがある場合のみSheetsを使う
+    return (
+        _HAS_SHEETS_LIBS and
+        ("SHEET_ID" in st.secrets) and
+        ("gcp_service_account" in st.secrets)
+    )
+
+@st.cache_resource(show_spinner=False)
+def get_gspread_client() -> "gspread.Client":
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    sa_info = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+def get_sheet() -> "gspread.Spreadsheet":
+    sheet_id = st.secrets["SHEET_ID"]
+    return get_gspread_client().open_by_key(sheet_id)
+
+def ws(name: str) -> "gspread.Worksheet":
+    return get_sheet().worksheet(name)
+
+def ensure_sheet_headers():
+    # responses / sessions シートの1行目にヘッダが入っていることを保証
+    wsr = ws("responses")
+    wss = ws("sessions")
+
+    resp_cols = response_schema_columns()
+    sess_cols = ["timestamp", "session_id", "status", "assigned_genre", "query_track_id"]  # status: reserved/completed
+
+    # responses
+    vals = wsr.get_all_values()
+    if not vals:
+        wsr.append_row(resp_cols, value_input_option="RAW")
     else:
-        row.to_csv(LOG_FILE, mode="w", header=True, index=False, encoding="utf-8-sig")
+        if len(vals[0]) == 0:
+            wsr.update("A1", [resp_cols])
+        # ヘッダが違う場合は警告（止めない）
+        # （本番中に勝手に上書きしないため）
+        # pass
+
+    # sessions
+    vals2 = wss.get_all_values()
+    if not vals2:
+        wss.append_row(sess_cols, value_input_option="RAW")
+    else:
+        if len(vals2[0]) == 0:
+            wss.update("A1", [sess_cols])
+
+def count_sessions_by_genre_sheets(now_ts: int) -> Dict[str, int]:
+    wss = ws("sessions")
+    recs = wss.get_all_records()  # list[dict]
+    counts = {g: 0 for g in PRIMARY_GENRES + [RESERVE_GENRE]}
+    for r in recs:
+        g = str(r.get("assigned_genre", "")).strip()
+        status = str(r.get("status", "")).strip()
+        ts = r.get("timestamp", None)
+        try:
+            ts = int(ts)
+        except Exception:
+            ts = None
+
+        if g not in counts:
+            continue
+
+        if status == "completed":
+            counts[g] += 1
+        elif status == "reserved":
+            if ts is not None and (now_ts - ts) <= RESERVATION_TTL_SEC:
+                counts[g] += 1
+    return counts
+
+def reserve_session_sheets(now_ts: int, session_id: str, assigned_genre: str, query_track_id: str) -> None:
+    wss = ws("sessions")
+    wss.append_row([now_ts, session_id, "reserved", assigned_genre, query_track_id], value_input_option="RAW")
+
+def mark_completed_sheets(session_id: str) -> None:
+    wss = ws("sessions")
+    cell = wss.find(session_id)
+    if cell is None:
+        return
+    # status列（3列目）
+    wss.update_cell(cell.row, 3, "completed")
+
+def is_completed_sheets(session_id: str) -> bool:
+    wss = ws("sessions")
+    cell = wss.find(session_id)
+    if cell is None:
+        return False
+    status = wss.cell(cell.row, 3).value
+    return str(status).strip() == "completed"
+
+def append_response_row_sheets(row: Dict[str, object]) -> None:
+    wsr = ws("responses")
+    cols = response_schema_columns()
+    values = [row.get(c, "") for c in cols]
+    wsr.append_row(values, value_input_option="RAW")
 
 
 ###############################################################################
-# Google Form prefill URL
+# Google Drive download (audio)
 ###############################################################################
-def build_prefilled_form_url(base_url: str, entry_map: Dict[str, str]) -> str:
-    from urllib.parse import urlencode
-    params = {k: v for k, v in entry_map.items() if k}
-    qs = urlencode(params)
-    sep = "&" if "?" in base_url else "?"
-    return base_url + sep + qs
-
-
-###############################################################################
-# Google Drive download
-###############################################################################
-_CONFIRM_RE = re.compile(r"confirm=([0-9A-Za-z_]+)")
-
 def drive_download_url(file_id: str) -> str:
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
@@ -200,11 +311,10 @@ def _download_bytes_via_requests(url: str, timeout: int = 30) -> bytes:
     sess = requests.Session()
     r = sess.get(url, stream=True, timeout=timeout)
     r.raise_for_status()
-
     ctype = (r.headers.get("content-type") or "").lower()
     if "text/html" in ctype:
         html = r.text
-        m = _CONFIRM_RE.search(html)
+        m = re.search(r"confirm=([0-9A-Za-z_]+)", html)
         if m:
             confirm = m.group(1)
             url2 = url + f"&confirm={confirm}"
@@ -217,7 +327,7 @@ def _download_bytes_via_urllib(url: str, timeout: int = 30) -> bytes:
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return resp.read()
 
-@st.cache_data(show_spinner=False, ttl=60 * 60, max_entries=500)
+@st.cache_data(show_spinner=False, ttl=60 * 60, max_entries=800)
 def download_mp3_bytes_from_drive(file_id: str) -> bytes:
     if not file_id:
         raise ValueError("drive_file_id is empty")
@@ -234,7 +344,6 @@ def download_mp3_bytes_from_drive(file_id: str) -> bytes:
 def load_assets() -> Tuple[np.ndarray, pd.DataFrame, Dict[str, int]]:
     npy_path = INDEX_DIR / EMB_NPY_NAME
     meta_path = INDEX_DIR / EMB_META_NAME
-
     if not npy_path.exists():
         raise FileNotFoundError(f"Embedding index not found: {npy_path}")
     if not meta_path.exists():
@@ -258,117 +367,110 @@ def load_assets() -> Tuple[np.ndarray, pd.DataFrame, Dict[str, int]]:
 ###############################################################################
 # UI
 ###############################################################################
-st.set_page_config(
-    page_title="Music Recommender (Experiment)",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="Music Recommender (Experiment)", layout="wide", initial_sidebar_state="collapsed")
+st.title("🎧 Music Recommender – Experiment")
 
-st.title("🎧 Music Recommender – Experiment (Drive Playback / pop reserve)")
-
-# Guide CSS
-st.markdown(
-    """
-<style>
-.guide {
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: #f1f7ff;
-  border: 1px solid rgba(0,0,0,0.08);
-  margin: 4px 0 8px 0;
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-def guide(text: str) -> None:
-    st.markdown(f"<div class='guide'>{text}</div>", unsafe_allow_html=True)
-
-
-# Load
-try:
-    V, meta, info = load_assets()
-except Exception as e:
-    st.error(f"読み込みに失敗しました: {e}")
-    st.stop()
-
-if len(V) == 0:
-    st.error("インデックスが空です。")
-    st.stop()
-
-# --- 被験者向け冒頭説明（バイアスが出ない内容）
 st.markdown(
     """
 ### このページで行うこと
-1. **基準曲（最初の曲）**を再生して聴いてください。  
-2. ボタン **「🔎 この曲から5つの楽曲を表示」** を押してください。  
-3. 表示された **A〜E の5曲**を順に聴いてください（表示順はランキング順ではありません）。  
-4. 表示される **Googleフォーム** に回答し、最後に **「完了」ボタン**を押してください。  
-
-※ 途中でブラウザを閉じた場合、カウントされません（「完了」ボタン押下時のみ記録されます）。
+1. **基準曲**を聴く  
+2. **Top5（A〜E）**を表示して聴く（表示順はランキング順ではありません）  
+3. **順位付け（1〜5、重複不可）**と、各曲の類似度アンケートに回答  
+4. **完了**を押して送信（この時点で保存・カウントされます）
 """
 )
+
+# Load assets
+V, meta, info = load_assets()
+
+# Detect backend
+USE_SHEETS = using_sheets_backend()
+if USE_SHEETS:
+    ensure_sheet_headers()
+
+# Sidebar admin
+with st.sidebar:
+    with st.expander("管理者情報（クリックで展開）", expanded=False):
+        st.write(f"Backend: {'Google Sheets' if USE_SHEETS else 'Local files'}")
+        st.write(f"Index rows: {info['index_rows']}")
+        st.write(f"Embedding dim: {info['dim']}")
+        if USE_SHEETS:
+            st.write("Sheets: responses / sessions")
+        else:
+            st.write(f"responses.csv: {RESPONSES_CSV}")
+            st.write(f"genre_counter.json: {COUNTERS_FILE}")
+            st.write(f"completed_sessions.json: {COMPLETED_FILE}")
 
 # Session init
 if "initialised" not in st.session_state:
     st.session_state["initialised"] = True
 
-    counters = load_counters()
-    assigned = assign_genre_pop_reserve(counters)
+    now_ts = int(time.time())
+    session_id = new_session_id()
 
-    if assigned is None:
-        st.session_state["closed"] = True
-        st.session_state["assigned_genre"] = None
-        st.session_state["session_id"] = None
+    if USE_SHEETS:
+        counts = count_sessions_by_genre_sheets(now_ts)
+        assigned = assign_genre_pop_reserve_from_counts(counts)
+        if assigned is None:
+            st.session_state["closed"] = True
+        else:
+            st.session_state["closed"] = False
+            st.session_state["assigned_genre"] = assigned
+            st.session_state["session_id"] = session_id
+            st.session_state["completed"] = False
+
+            st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
+            reserve_session_sheets(now_ts, session_id, assigned, st.session_state["query_track_id"])
     else:
-        st.session_state["closed"] = False
-        st.session_state["assigned_genre"] = assigned
-        st.session_state["session_id"] = new_session_id()
-        st.session_state["completed"] = False
+        counters = load_counters_local()
+        assigned = assign_genre_pop_reserve_from_counts(counters)
+        if assigned is None:
+            st.session_state["closed"] = True
+        else:
+            st.session_state["closed"] = False
+            st.session_state["assigned_genre"] = assigned
+            st.session_state["session_id"] = session_id
+            st.session_state["completed"] = False
+            st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
+            append_session_log_local(session_id, assigned, st.session_state["query_track_id"])
 
-        st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
-
-        # base_idx を track_id で検索
+    if not st.session_state.get("closed"):
+        # find query base idx
         base_idx: Optional[int] = None
         qid = normalize_track_id(st.session_state["query_track_id"])
         if qid and "track_id" in meta.columns:
             mask = meta["track_id"].astype(str).map(normalize_track_id) == qid
             if mask.any():
                 base_idx = int(np.argmax(mask.values))
-
         if base_idx is None:
             rng_tmp = np.random.default_rng(RANDOM_SEED)
             base_idx = int(rng_tmp.integers(0, len(V)))
             st.session_state["query_track_id"] = str(meta.loc[base_idx].get("track_id", ""))
-
         st.session_state["base_idx"] = base_idx
 
+        # caches
         st.session_state["topk_idx"] = None
         st.session_state["topk_sim"] = None
         st.session_state["shuffle_order"] = None
-        st.session_state["prefilled_url"] = None
 
-# Closed
+        # defaults
+        for L in LETTERS:
+            st.session_state[f"rank_{L}"] = None
+        for L in LETTERS:
+            for feat in FEATURES:
+                st.session_state[f"{L}_{feat}"] = 3
+        st.session_state["music_hours_per_day"] = MUSIC_HOURS_OPTIONS[0]
+        st.session_state["age"] = AGE_GROUP_OPTIONS[1]
+        st.session_state["gender"] = "未回答"
+        st.session_state["usability"] = 3
+        st.session_state["ui_visibility"] = 3
+        st.session_state["free_comment"] = ""
+
 if st.session_state.get("closed"):
     st.error("全ジャンルが満員です（実験終了）。")
     st.stop()
 
-# Sidebar（管理者用）
-with st.sidebar:
-    with st.expander("管理者情報（クリックで展開）", expanded=False):
-        st.write(f"Index rows: {info['index_rows']}")
-        st.write(f"Embedding dim: {info['dim']}")
-        st.write(f"requests available: {bool(info['has_requests'])}")
-        st.write("---")
-        st.write(f"Assigned genre: {st.session_state.get('assigned_genre')}")
-        st.write(f"Session ID: {st.session_state.get('session_id')}")
-        st.write(f"Query track_id: {st.session_state.get('query_track_id')}")
-
-
-###############################################################################
 # Playback helper
-###############################################################################
 def play_by_meta_row(row: pd.Series) -> None:
     file_id = str(row.get("drive_file_id", "") or "").strip()
     if not file_id:
@@ -381,141 +483,220 @@ def play_by_meta_row(row: pd.Series) -> None:
         st.warning("⚠️ Drive から音源取得に失敗しました。")
         st.caption(f"debug: drive_file_id={file_id} / error={e}")
 
-
-###############################################################################
-# Step1: Query
-###############################################################################
-guide("① まず、基準となる曲を聴いてください。")
-
+# Step 1
+st.markdown("## ① 基準曲")
+st.caption("※ 30秒程度の試聴を推奨します")
 base_idx = int(st.session_state["base_idx"])
 base_row = meta.iloc[base_idx]
-
-st.subheader("🎵 基準曲 (Query Track)")
 title = str(base_row.get("title", "") or "")
 artist = str(base_row.get("artist", "") or "")
 if title or artist:
     st.markdown(f"**{title}**  —  {artist}".strip())
 else:
-    st.markdown(f"**track_id={base_row.get('track_id', '')}**")
-
+    st.markdown(f"**track_id={base_row.get('track_id','')}**")
 play_by_meta_row(base_row)
 
-###############################################################################
-# Step2: Top5 (いつでも押せる)
-###############################################################################
+# Step 2
+st.markdown("## ② Top5を表示")
 run = st.button("🔎 この曲から5つの楽曲を表示", type="primary")
-
 if run:
     q_vec = V[base_idx]
     idx_arr, sim_arr = cosine_topk(V, q_vec, topk=TOPK_FIXED, exclude_idx=base_idx)
-
     st.session_state["topk_idx"] = idx_arr
     st.session_state["topk_sim"] = sim_arr
-
     rng = np.random.default_rng(RANDOM_SEED)
     st.session_state["shuffle_order"] = rng.permutation(len(idx_arr))
-
-    # Top5が出たら、アンケート表示を有効化
-    st.session_state["prefilled_url"] = None
+    for L in LETTERS:
+        st.session_state[f"rank_{L}"] = None
     st.rerun()
 
-###############################################################################
-# Step3: Show results (shuffled) + show form immediately
-###############################################################################
+# Step 3
 if st.session_state.get("topk_idx") is not None:
     idx_arr = st.session_state["topk_idx"]
     sim_arr = st.session_state["topk_sim"]
     order = st.session_state.get("shuffle_order")
 
     rows_true: List[dict] = []
-    for rank, (i_val, s_val) in enumerate(zip(idx_arr, sim_arr), start=1):
+    for true_rank, (i_val, s_val) in enumerate(zip(idx_arr, sim_arr), start=1):
         i_int = int(i_val)
         r = meta.iloc[i_int]
         rows_true.append({
-            "true_rank": rank,
+            "true_rank": true_rank,
             "similarity": float(np.round(s_val, 6)),
             "index": i_int,
-            "track_id": str(r.get("track_id", "")),
-            "title": str(r.get("title", "") or ""),
-            "artist": str(r.get("artist", "") or ""),
+            "track_id": str(r.get("track_id","")),
+            "title": str(r.get("title","") or ""),
+            "artist": str(r.get("artist","") or ""),
         })
 
-    if order is not None:
-        rows_disp = [rows_true[i] for i in order]
-    else:
-        rows_disp = rows_true
+    rows_disp = [rows_true[i] for i in order] if order is not None else rows_true
+    disp_map = {L: row for L, row in zip(LETTERS, rows_disp)}
 
-    letters = ["A", "B", "C", "D", "E"]
+    st.markdown("## ③ 推薦曲（A〜E）")
+    st.caption("A〜Eの表示順はランキング順ではありません。")
 
-    guide("②’ 表示された5曲（A〜E）を聴いてください（表示順はランキング順ではありません）。")
-
-    st.markdown("### 🎧 推薦曲プレビュー（A〜E）")
-    for letter, r in zip(letters, rows_disp):
-        header = f"{letter}"
+    for L in LETTERS:
+        r = disp_map[L]
+        header = f"{L}"
         if r["title"]:
             header += f": {r['title']}"
         if r["artist"]:
             header += f" — {r['artist']}"
-        st.markdown(f"**{header}**")
+        st.markdown(f"### {header}")
+        st.caption("※ 15秒ほどの試聴を推奨します")
         play_by_meta_row(meta.iloc[int(r["index"])])
 
-    # Prefilled URL（Top5があるなら即作る）
-    if st.session_state.get("prefilled_url") is None:
-        params: Dict[str, str] = {}
-        sid = st.session_state.get("session_id", "") or ""
-        assigned_genre = st.session_state.get("assigned_genre", "") or ""
+    st.markdown("## ④ アンケート")
 
-        params[FORM_ENTRY_IDS.get("session_id", "")] = sid
-        params[FORM_ENTRY_IDS.get("assigned_genre", "")] = assigned_genre
-        params[FORM_ENTRY_IDS.get("query_track_id", "")] = str(st.session_state.get("query_track_id", "") or "")
+    with st.expander("基本情報（年齢・性別・音楽視聴時間）", expanded=True):
+        st.session_state["music_hours_per_day"] = st.radio(
+            "1日にどれくらい音楽を聴きますか",
+            options=MUSIC_HOURS_OPTIONS,
+            index=MUSIC_HOURS_OPTIONS.index(st.session_state.get("music_hours_per_day", MUSIC_HOURS_OPTIONS[0])),
+            horizontal=True,
+        )
+        st.session_state["age"] = st.radio(
+            "年齢",
+            options=AGE_GROUP_OPTIONS,
+            index=AGE_GROUP_OPTIONS.index(st.session_state.get("age", AGE_GROUP_OPTIONS[1])),
+            horizontal=True,
+        )
+        st.session_state["gender"] = st.selectbox(
+            "性別",
+            options=GENDER_OPTIONS,
+            index=GENDER_OPTIONS.index(st.session_state.get("gender", "未回答")) if st.session_state.get("gender","未回答") in GENDER_OPTIONS else 0,
+        )
 
-        for pos, r in enumerate(rows_true, start=1):
-            params[FORM_ENTRY_IDS.get(f"rec_track_id_{pos}", "")] = str(r["track_id"])
-            params[FORM_ENTRY_IDS.get(f"true_rank_{pos}", "")] = str(r["true_rank"])
-            params[FORM_ENTRY_IDS.get(f"sim_{pos}", "")] = str(r["similarity"])
+    st.markdown("### ✅ 順位付け（似ている順に 1〜5、重複不可）")
 
-        shuffle_pos_map: Dict[int, int] = {}
-        if order is not None:
-            for disp_pos, true_index in enumerate(order.tolist(), start=1):
-                shuffle_pos_map[true_index] = disp_pos
-        for pos in range(1, TOPK_FIXED + 1):
-            params[FORM_ENTRY_IDS.get(f"shuffle_pos_{pos}", "")] = str(shuffle_pos_map.get(pos - 1, pos))
+    def rank_select(letter: str):
+        key = f"rank_{letter}"
+        options = ["未選択", "1", "2", "3", "4", "5"]
+        cur = st.session_state.get(key)
+        idx = 0
+        if isinstance(cur, int) and 1 <= cur <= 5:
+            idx = options.index(str(cur))
+        sel = st.selectbox(f"{letter} の順位", options=options, index=idx, key=f"ui_{key}")
+        st.session_state[key] = None if sel == "未選択" else int(sel)
 
-        prefilled_url_val = build_prefilled_form_url(GOOGLE_FORM_URL, params)
-        st.session_state["prefilled_url"] = prefilled_url_val
+    c1, c2 = st.columns(2)
+    with c1:
+        rank_select("A"); rank_select("C"); rank_select("E")
+    with c2:
+        rank_select("B"); rank_select("D")
 
-        try:
-            log_session_csv(sid, assigned_genre, time.time(), prefilled_url_val)
-        except Exception as e:
-            st.warning(f"ログ書き込みに失敗しました: {e}")
+    ranks = [st.session_state.get(f"rank_{L}") for L in LETTERS]
+    all_selected = all(isinstance(v, int) for v in ranks)
+    no_dup = (len(set(ranks)) == 5) if all_selected else False
+    if not all_selected:
+        st.warning("順位が未選択の項目があります。A〜Eすべて選択してください。")
+    elif not no_dup:
+        st.error("順位が重複しています。1〜5がそれぞれ一度ずつになるように修正してください。")
+    else:
+        st.success("順位の入力はOKです。")
 
-    # Form & Complete (即表示)
-    guide("③ アンケート（Googleフォーム）に回答し、最後に「完了」ボタンを押してください。")
+    st.markdown("### 🎚️ 類似度評価（1=似ていない ～ 5=とても似ている）")
+    label_map = {
+        "tempo": "テンポ（速さ）",
+        "rhythm": "リズム（ノリ）",
+        "vocal": "ボーカル（声色）",
+        "melody": "メロディ",
+        "genre_sim": "ジャンル",
+    }
+    for L in LETTERS:
+        with st.expander(f"{L} の評価", expanded=False):
+            for feat in FEATURES:
+                k = f"{L}_{feat}"
+                st.session_state[k] = st.slider(
+                    f"{label_map[feat]}の類似度",
+                    min_value=LIKERT_MIN, max_value=LIKERT_MAX,
+                    value=int(st.session_state.get(k, 3)),
+                    step=1, key=f"ui_{k}"
+                )
 
-    if st.session_state.get("prefilled_url"):
-        st.link_button("✅ Googleフォームへ進む", st.session_state["prefilled_url"])
+    st.markdown("### 💡 アプリについて")
+    st.session_state["usability"] = st.slider(
+        "アプリの使いやすさ（1=悪い ～ 5=良い）",
+        min_value=LIKERT_MIN, max_value=LIKERT_MAX,
+        value=int(st.session_state.get("usability", 3)),
+        step=1, key="ui_usability"
+    )
+    st.session_state["ui_visibility"] = st.slider(
+        "UIの見やすさ（1=悪い ～ 5=良い）",
+        min_value=LIKERT_MIN, max_value=LIKERT_MAX,
+        value=int(st.session_state.get("ui_visibility", 3)),
+        step=1, key="ui_ui_visibility"
+    )
+    st.session_state["free_comment"] = st.text_area(
+        "本アプリについてご意見をお聞かせください（自由記述）",
+        value=str(st.session_state.get("free_comment","")),
+        key="ui_free_comment",
+        height=120
+    )
 
-        if not st.session_state.get("completed"):
-            if st.button("🎉 完了 (クリックして参加を完了)"):
-                counters = load_counters()
-                completed_ids = load_completed()
-                sid = st.session_state.get("session_id", "") or ""
-                g = st.session_state.get("assigned_genre", "") or ""
+    st.markdown("## ✅ 完了")
 
-                # 二重加算防止
-                if sid and sid not in completed_ids:
-                    completed_ids.add(sid)
-                    counters[g] = int(counters.get(g, 0)) + 1
-                    try:
-                        save_counters(counters)
-                        save_completed(completed_ids)
-                    except Exception as e:
-                        st.warning(f"保存に失敗しました: {e}")
+    gender_ok = st.session_state.get("gender") not in (None, "", "未回答")
+    demo_ok = (st.session_state.get("music_hours_per_day") in MUSIC_HOURS_OPTIONS and
+               st.session_state.get("age") in AGE_GROUP_OPTIONS and gender_ok)
+    can_submit = all_selected and no_dup and demo_ok and (not st.session_state.get("completed", False))
 
+    if not gender_ok:
+        st.warning("性別が「未回答」です。回答しない場合は「回答しない」を選んでください。")
+
+    if st.session_state.get("completed"):
+        st.success("このセッションは既に完了しています。ありがとうございました！")
+    else:
+        if st.button("🎉 完了（保存）", type="primary", disabled=(not can_submit)):
+            sid = st.session_state.get("session_id", "") or ""
+
+            # Cloud: sessionsにcompletedが付いているなら二重送信扱い
+            if USE_SHEETS and is_completed_sheets(sid):
                 st.session_state["completed"] = True
-                st.success("ご参加ありがとうございました。回答が記録されました。ブラウザを閉じて構いません。")
-        else:
-            st.success("このセッションは既に完了しました。ありがとうございました！")
+                st.info("このセッションは既に完了済みです。")
+                st.stop()
+
+            # Build row
+            row: Dict[str, object] = {}
+            row["timestamp"] = int(time.time())
+            row["session_id"] = sid
+            row["assigned_genre"] = st.session_state.get("assigned_genre", "")
+            row["query_track_id"] = st.session_state.get("query_track_id", "")
+            row["music_hours_per_day"] = st.session_state.get("music_hours_per_day", "")
+            row["age"] = st.session_state.get("age", "")
+            row["gender"] = st.session_state.get("gender", "")
+
+            for L in LETTERS:
+                row[f"{L}_track_id"] = str(disp_map[L]["track_id"])
+                row[f"{L}_true_rank"] = int(disp_map[L]["true_rank"])
+                row[f"{L}_sim"] = float(disp_map[L]["similarity"])
+                row[f"rank_{L}"] = int(st.session_state.get(f"rank_{L}"))
+
+            for L in LETTERS:
+                for feat in FEATURES:
+                    row[f"{L}_{feat}"] = int(st.session_state.get(f"{L}_{feat}", 3))
+
+            row["usability"] = int(st.session_state.get("usability", 3))
+            row["ui_visibility"] = int(st.session_state.get("ui_visibility", 3))
+            row["free_comment"] = str(st.session_state.get("free_comment", ""))
+
+            # Save
+            if USE_SHEETS:
+                append_response_row_sheets(row)
+                mark_completed_sheets(sid)
+            else:
+                append_response_row_local(row)
+                # local counters/completed
+                completed_ids = load_completed_local()
+                completed_ids.add(sid)
+                save_completed_local(completed_ids)
+                counters = load_counters_local()
+                g = st.session_state.get("assigned_genre","")
+                counters[g] = int(counters.get(g, 0)) + 1
+                save_counters_local(counters)
+
+            st.session_state["completed"] = True
+            st.success("保存しました。ご協力ありがとうございました！ブラウザを閉じて構いません。")
 
 else:
-    st.caption("※ まだTop5を表示していません。上のボタンを押してください。")
+    st.info("まず「🔎 この曲から5つの楽曲を表示」を押してください。")
