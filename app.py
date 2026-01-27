@@ -33,7 +33,7 @@ except Exception:
     _HAS_REQUESTS = False
     import urllib.request
 
-# Sheets用（Secretsがあるときだけ使う）
+# Sheets用
 try:
     import gspread  # type: ignore
     from google.oauth2.service_account import Credentials  # type: ignore
@@ -87,7 +87,6 @@ MUSIC_HOURS_OPTIONS = ["全く聴かない", "３０分未満", "１時間", "�
 AGE_GROUP_OPTIONS = ["１０代", "２０代", "３０代", "４０代以上"]
 GENDER_OPTIONS = ["未回答", "男性", "女性", "その他", "回答しない"]
 
-# Cloud同時アクセスで枠が塞がり続けないように「予約」の有効期限を入れる
 RESERVATION_TTL_SEC = 60 * 60  # 1時間
 
 
@@ -200,20 +199,24 @@ def append_response_row_local(row: Dict[str, object]) -> None:
 
 
 ###############################################################################
-# Google Sheets backend
+# Google Sheets backend (GCP_SA_JSON 対応)
 ###############################################################################
 def using_sheets_backend() -> bool:
     # Secretsがある＋ライブラリがある場合のみSheetsを使う
     return (
         _HAS_SHEETS_LIBS and
         ("SHEET_ID" in st.secrets) and
-        ("gcp_service_account" in st.secrets)
+        ("GCP_SA_JSON" in st.secrets)  # ★ここがポイント
     )
 
 @st.cache_resource(show_spinner=False)
 def get_gspread_client() -> "gspread.Client":
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    sa_info = dict(st.secrets["gcp_service_account"])
+
+    # ★ Secrets の GCP_SA_JSON を丸ごとJSONとして読む
+    sa_json_str = st.secrets["GCP_SA_JSON"]
+    sa_info = json.loads(sa_json_str)
+
     creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
     return gspread.authorize(creds)
 
@@ -225,25 +228,19 @@ def ws(name: str) -> "gspread.Worksheet":
     return get_sheet().worksheet(name)
 
 def ensure_sheet_headers():
-    # responses / sessions シートの1行目にヘッダが入っていることを保証
     wsr = ws("responses")
     wss = ws("sessions")
 
     resp_cols = response_schema_columns()
-    sess_cols = ["timestamp", "session_id", "status", "assigned_genre", "query_track_id"]  # status: reserved/completed
+    sess_cols = ["timestamp", "session_id", "status", "assigned_genre", "query_track_id"]  # reserved/completed
 
-    # responses
     vals = wsr.get_all_values()
     if not vals:
         wsr.append_row(resp_cols, value_input_option="RAW")
     else:
         if len(vals[0]) == 0:
             wsr.update("A1", [resp_cols])
-        # ヘッダが違う場合は警告（止めない）
-        # （本番中に勝手に上書きしないため）
-        # pass
 
-    # sessions
     vals2 = wss.get_all_values()
     if not vals2:
         wss.append_row(sess_cols, value_input_option="RAW")
@@ -253,7 +250,7 @@ def ensure_sheet_headers():
 
 def count_sessions_by_genre_sheets(now_ts: int) -> Dict[str, int]:
     wss = ws("sessions")
-    recs = wss.get_all_records()  # list[dict]
+    recs = wss.get_all_records()
     counts = {g: 0 for g in PRIMARY_GENRES + [RESERVE_GENRE]}
     for r in recs:
         g = str(r.get("assigned_genre", "")).strip()
@@ -283,8 +280,7 @@ def mark_completed_sheets(session_id: str) -> None:
     cell = wss.find(session_id)
     if cell is None:
         return
-    # status列（3列目）
-    wss.update_cell(cell.row, 3, "completed")
+    wss.update_cell(cell.row, 3, "completed")  # status列
 
 def is_completed_sheets(session_id: str) -> bool:
     wss = ws("sessions")
@@ -386,7 +382,12 @@ V, meta, info = load_assets()
 # Detect backend
 USE_SHEETS = using_sheets_backend()
 if USE_SHEETS:
-    ensure_sheet_headers()
+    try:
+        ensure_sheet_headers()
+    except Exception as e:
+        st.error("Google Sheets への接続に失敗しました。Secrets / Sheet共有設定を確認してください。")
+        st.caption(f"debug: {type(e).__name__}: {e}")
+        st.stop()
 
 # Sidebar admin
 with st.sidebar:
@@ -398,8 +399,6 @@ with st.sidebar:
             st.write("Sheets: responses / sessions")
         else:
             st.write(f"responses.csv: {RESPONSES_CSV}")
-            st.write(f"genre_counter.json: {COUNTERS_FILE}")
-            st.write(f"completed_sessions.json: {COMPLETED_FILE}")
 
 # Session init
 if "initialised" not in st.session_state:
@@ -418,7 +417,6 @@ if "initialised" not in st.session_state:
             st.session_state["assigned_genre"] = assigned
             st.session_state["session_id"] = session_id
             st.session_state["completed"] = False
-
             st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
             reserve_session_sheets(now_ts, session_id, assigned, st.session_state["query_track_id"])
     else:
@@ -435,7 +433,6 @@ if "initialised" not in st.session_state:
             append_session_log_local(session_id, assigned, st.session_state["query_track_id"])
 
     if not st.session_state.get("closed"):
-        # find query base idx
         base_idx: Optional[int] = None
         qid = normalize_track_id(st.session_state["query_track_id"])
         if qid and "track_id" in meta.columns:
@@ -448,12 +445,10 @@ if "initialised" not in st.session_state:
             st.session_state["query_track_id"] = str(meta.loc[base_idx].get("track_id", ""))
         st.session_state["base_idx"] = base_idx
 
-        # caches
         st.session_state["topk_idx"] = None
         st.session_state["topk_sim"] = None
         st.session_state["shuffle_order"] = None
 
-        # defaults
         for L in LETTERS:
             st.session_state[f"rank_{L}"] = None
         for L in LETTERS:
@@ -476,12 +471,8 @@ def play_by_meta_row(row: pd.Series) -> None:
     if not file_id:
         st.warning("⚠️ 音源が再生できません（drive_file_id が空です）。")
         return
-    try:
-        audio_bytes = download_mp3_bytes_from_drive(file_id)
-        st.audio(audio_bytes, format="audio/mp3")
-    except Exception as e:
-        st.warning("⚠️ Drive から音源取得に失敗しました。")
-        st.caption(f"debug: drive_file_id={file_id} / error={e}")
+    audio_bytes = download_mp3_bytes_from_drive(file_id)
+    st.audio(audio_bytes, format="audio/mp3")
 
 # Step 1
 st.markdown("## ① 基準曲")
@@ -534,7 +525,6 @@ if st.session_state.get("topk_idx") is not None:
 
     st.markdown("## ③ 推薦曲（A〜E）")
     st.caption("A〜Eの表示順はランキング順ではありません。")
-
     for L in LETTERS:
         r = disp_map[L]
         header = f"{L}"
@@ -650,13 +640,11 @@ if st.session_state.get("topk_idx") is not None:
         if st.button("🎉 完了（保存）", type="primary", disabled=(not can_submit)):
             sid = st.session_state.get("session_id", "") or ""
 
-            # Cloud: sessionsにcompletedが付いているなら二重送信扱い
             if USE_SHEETS and is_completed_sheets(sid):
                 st.session_state["completed"] = True
                 st.info("このセッションは既に完了済みです。")
                 st.stop()
 
-            # Build row
             row: Dict[str, object] = {}
             row["timestamp"] = int(time.time())
             row["session_id"] = sid
@@ -680,13 +668,11 @@ if st.session_state.get("topk_idx") is not None:
             row["ui_visibility"] = int(st.session_state.get("ui_visibility", 3))
             row["free_comment"] = str(st.session_state.get("free_comment", ""))
 
-            # Save
             if USE_SHEETS:
                 append_response_row_sheets(row)
                 mark_completed_sheets(sid)
             else:
                 append_response_row_local(row)
-                # local counters/completed
                 completed_ids = load_completed_local()
                 completed_ids.add(sid)
                 save_completed_local(completed_ids)
