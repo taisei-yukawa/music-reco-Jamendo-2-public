@@ -1,4 +1,7 @@
+streamlit==1.41.1
+altair==4.2.2
 numpy==1.26.4
-pandas
-streamlit
-requests
+pandas==2.2.3
+requests==2.32.3
+gspread==6.1.4
+google-auth==2.34.0
