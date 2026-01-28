@@ -456,7 +456,7 @@ st.markdown(
 ### このページで行うこと
 1. **基準曲**を聴く  
 2. **Top5（A〜E）**を表示して聴く（表示順はランキング順ではありません）  
-3. **推薦曲 A〜E の順位を入力**  
+3. **推薦曲 A〜E の類似度順位を入力**  
 4. **各曲の類似度アンケートに回答**  
 5. **アプリ全体に関する評価と自由記述**  
 6. **基本情報（年齢・性別・音楽視聴時間）を入力**  
@@ -592,7 +592,7 @@ def play_by_meta_row(row: pd.Series) -> None:
 
 # Step 1
 st.markdown("## ① 基準曲")
-st.caption("※ 30秒程度の試聴を推奨します")
+st.caption("※ 30秒程度の試聴を推奨します。バーを動かして飛ばしながら聴いていただいても構いません。")
 base_idx = int(st.session_state["base_idx"])
 base_row = meta.iloc[base_idx]
 title = str(base_row.get("title", "") or "")
@@ -673,7 +673,7 @@ if st.session_state.get("topk_idx") is not None:
             except ValueError:
                 idx_sel = 0
         sel = st.selectbox(
-            f"{L} の順位を選択",
+            f"{L} の類似度順位を選択",
             options=rank_options,
             index=idx_sel,
             key=f"ui_{rank_key}"
@@ -685,7 +685,7 @@ if st.session_state.get("topk_idx") is not None:
     all_selected = all(isinstance(v, int) for v in ranks)
     no_dup = (len(set(ranks)) == 5) if all_selected else False
     if not all_selected:
-        st.warning("順位が未選択の項目があります。A〜Eすべて選択してください。")
+        st.warning("類似度順位が未選択の項目があります。A〜Eすべて選択してください。")
     elif not no_dup:
         st.error("順位が重複しています。1〜5がそれぞれ一度ずつになるように修正してください。")
     else:
@@ -735,7 +735,7 @@ if st.session_state.get("topk_idx") is not None:
     # Step 6: Basic demographic information moved to the end
     st.markdown("## ⑥ 基本情報（年齢・性別・音楽視聴時間）")
     # We still group these in an expander for compactness
-    with st.expander("基本情報を入力（クリックで展開）", expanded=True):
+    with st.expander("基本情報を入力", expanded=True):
         st.session_state["music_hours_per_day"] = st.radio(
             "1日にどれくらい音楽を聴きますか",
             options=MUSIC_HOURS_OPTIONS,
