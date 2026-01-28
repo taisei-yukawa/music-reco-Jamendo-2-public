@@ -15,7 +15,8 @@ UIは維持したまま、保存先だけを自動切替：
 このバージョンでは以下の点を改善しました。
 
 * **session_id の登録タイミングを変更**  
-  これまではセッション開始時に `reserve_session_sheets()` または `append_session_log_local()` を呼び出していましたが、アンケートを開始しただけで session_id が記録されてしまう問題がありました。  
+  これまではセッション開始時に `reserve_session_sheets()` または `append_session_log_local()`
+  を呼び出していましたが、アンケートを開始しただけで session_id が記録されてしまう問題がありました。  
   この版では、セッション ID の登録およびステータス更新は完了ボタンを押したタイミングで行われます。初期化時にはジャンル割当てのみを行い、実際の登録は完了時に実施します。
 
 * **推薦曲の下に順位入力欄を配置**  
@@ -81,7 +82,7 @@ RANDOM_SEED = None
 
 # 「間隔を広げる」：真順位 1,5,10,15,20 を選ぶ（0-indexなら 0,4,9,14,19）
 # 全ジャンル共通で固定
-SPACED_RANK_POSITIONS = [0, 4, 9, 14, 19]
+SPACED_RANK_POSITIONS = [0, 19, 39, 59, 79]
 
 PRIMARY_GENRES: List[str] = ["classical", "jazz", "rock", "hiphop"]
 RESERVE_GENRE: str = "pop"
