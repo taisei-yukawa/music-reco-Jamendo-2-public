@@ -832,7 +832,7 @@ if st.session_state.get("topk_idx") is not None:
                     st.warning("Google Sheets への保存に失敗したため、ローカルに保存しました（管理者に連絡してください）。")
 
             st.session_state["completed"] = True
-            st.success("保存しました。ご協力ありがとうございました！ブラウザを閉じてください。。")
+            st.success("保存しました。ご協力ありがとうございました！ブラウザを閉じてください。")
 
 else:
     st.info("まず「🔎 この曲から5つの楽曲を表示」を押してください。")
