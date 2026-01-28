@@ -22,3 +22,10 @@ __pycache__/
 # OS
 Thumbs.db
 .DS_Store
+
+# local experiment outputs
+/data/
+/results/
+*.pyc
+__pycache__/
+
