@@ -59,6 +59,10 @@ SESSIONS_LOG_CSV = DATA_DIR / "sessions_log.csv"
 TOPK_FIXED = 5
 RANDOM_SEED = None
 
+# 「間隔を広げる」：真順位 1,5,10,15,20 を選ぶ（0-indexなら 0,4,9,14,19）
+# 全ジャンル共通で固定
+SPACED_RANK_POSITIONS = [0, 4, 9, 14, 19]
+
 PRIMARY_GENRES: List[str] = ["classical", "jazz", "rock", "hiphop"]
 RESERVE_GENRE: str = "pop"
 PRIMARY_ORDER: List[str] = ["classical", "jazz", "rock", "hiphop"]
@@ -97,18 +101,6 @@ def l2_unit(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     n = float(np.linalg.norm(x))
     return x / (n + eps)
 
-def cosine_topk(
-    V: np.ndarray,
-    q: np.ndarray,
-    topk: int,
-    exclude_idx: Optional[int] = None
-) -> Tuple[np.ndarray, np.ndarray]:
-    sims = V @ q
-    if exclude_idx is not None and 0 <= exclude_idx < len(sims):
-        sims[exclude_idx] = -1e9
-    idx = np.argsort(-sims)[:topk]
-    return idx, sims[idx]
-
 def normalize_track_id(x: object) -> str:
     if x is None:
         return ""
@@ -116,6 +108,57 @@ def normalize_track_id(x: object) -> str:
 
 def new_session_id() -> str:
     return uuid.uuid4().hex
+
+def _retry(fn, tries: int = 3, base_sleep: float = 0.6):
+    """
+    Sheets通信の一時失敗対策：軽いリトライ
+    """
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            time.sleep(base_sleep * (2 ** i))
+    raise last  # type: ignore
+
+def cosine_spaced_pick(
+    V: np.ndarray,
+    q: np.ndarray,
+    topk: int,
+    positions: List[int],
+    exclude_idx: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    類似度上位から「指定順位（positions）」を間引いて選ぶ。
+    例：positions=[0,4,9,14,19] -> 真順位 1,5,10,15,20
+
+    戻り値：
+    - idx_pick: 選ばれたインデックス（len=topk）
+    - sim_pick: その類似度
+    - rank_pick: 真順位（1-index）
+    """
+    sims = V @ q
+    if exclude_idx is not None and 0 <= exclude_idx < len(sims):
+        sims[exclude_idx] = -1e9
+
+    order = np.argsort(-sims)  # 真順位（0-index）
+    pick_pos = [p for p in positions if 0 <= p < len(order)]
+
+    # 5個取れない場合の保険：最後のpos以降から順に埋める
+    if len(pick_pos) < topk:
+        start = (pick_pos[-1] + 1) if pick_pos else 0
+        for p in range(start, len(order)):
+            if p not in pick_pos:
+                pick_pos.append(p)
+            if len(pick_pos) >= topk:
+                break
+
+    pick_pos = pick_pos[:topk]
+    idx_pick = np.array([int(order[p]) for p in pick_pos], dtype=int)
+    sim_pick = np.array([float(sims[idx]) for idx in idx_pick], dtype=float)
+    rank_pick = np.array([int(p + 1) for p in pick_pos], dtype=int)  # 1-index
+    return idx_pick, sim_pick, rank_pick
 
 
 ###############################################################################
@@ -179,7 +222,7 @@ def append_session_log_local(session_id: str, assigned_genre: str, query_track_i
 # Response schema (shared)
 ###############################################################################
 def response_schema_columns() -> List[str]:
-    cols: List[str] = []
+    cols = []
     cols += ["timestamp", "session_id", "assigned_genre", "query_track_id"]
     cols += ["music_hours_per_day", "age", "gender"]
     cols += ["A_track_id", "B_track_id", "C_track_id", "D_track_id", "E_track_id"]
@@ -204,7 +247,7 @@ def append_response_row_local(row: Dict[str, object]) -> None:
 
 
 ###############################################################################
-# Google Sheets backend (GCP_SA_JSON 対応)
+# Google Sheets backend (GCP_SA_JSON 対応) + 安定化
 ###############################################################################
 def using_sheets_backend() -> bool:
     return (
@@ -215,93 +258,103 @@ def using_sheets_backend() -> bool:
 
 @st.cache_resource(show_spinner=False)
 def get_gspread_client() -> "gspread.Client":
-    # 安全側でDriveも含める（open_by_key等で要求される場合がある）
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-
     sa_json_str = st.secrets["GCP_SA_JSON"]
     sa_info = json.loads(sa_json_str)
-
     creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
     return gspread.authorize(creds)
 
-def get_sheet() -> "gspread.Spreadsheet":
+@st.cache_resource(show_spinner=False)
+def get_sheet_cached() -> "gspread.Spreadsheet":
     sheet_id = st.secrets["SHEET_ID"]
     return get_gspread_client().open_by_key(sheet_id)
 
 def ws(name: str) -> "gspread.Worksheet":
-    return get_sheet().worksheet(name)
+    return get_sheet_cached().worksheet(name)
 
 def ensure_sheet_headers():
-    wsr = ws("responses")
-    wss = ws("sessions")
+    def _do():
+        wsr = ws("responses")
+        wss = ws("sessions")
 
-    resp_cols = response_schema_columns()
-    sess_cols = ["timestamp", "session_id", "status", "assigned_genre", "query_track_id"]  # reserved/completed
+        resp_cols = response_schema_columns()
+        sess_cols = ["timestamp", "session_id", "status", "assigned_genre", "query_track_id"]  # reserved/completed
 
-    vals = wsr.get_all_values()
-    if not vals:
-        wsr.append_row(resp_cols, value_input_option="RAW")
-    else:
-        if len(vals[0]) == 0:
-            wsr.update("A1", [resp_cols])
+        vals = wsr.get_all_values()
+        if not vals:
+            wsr.append_row(resp_cols, value_input_option="RAW")
+        else:
+            if len(vals[0]) == 0:
+                wsr.update("A1", [resp_cols])
 
-    vals2 = wss.get_all_values()
-    if not vals2:
-        wss.append_row(sess_cols, value_input_option="RAW")
-    else:
-        if len(vals2[0]) == 0:
-            wss.update("A1", [sess_cols])
+        vals2 = wss.get_all_values()
+        if not vals2:
+            wss.append_row(sess_cols, value_input_option="RAW")
+        else:
+            if len(vals2[0]) == 0:
+                wss.update("A1", [sess_cols])
+    _retry(_do, tries=3, base_sleep=0.6)
 
 def count_sessions_by_genre_sheets(now_ts: int) -> Dict[str, int]:
-    wss = ws("sessions")
-    recs = wss.get_all_records()
-    counts = {g: 0 for g in PRIMARY_GENRES + [RESERVE_GENRE]}
-    for r in recs:
-        g = str(r.get("assigned_genre", "")).strip()
-        status = str(r.get("status", "")).strip()
-        ts = r.get("timestamp", None)
-        try:
-            ts = int(ts)
-        except Exception:
-            ts = None
+    def _do():
+        wss = ws("sessions")
+        recs = wss.get_all_records()
+        counts = {g: 0 for g in PRIMARY_GENRES + [RESERVE_GENRE]}
+        for r in recs:
+            g = str(r.get("assigned_genre", "")).strip()
+            status = str(r.get("status", "")).strip()
+            ts = r.get("timestamp", None)
+            try:
+                ts = int(ts)
+            except Exception:
+                ts = None
 
-        if g not in counts:
-            continue
+            if g not in counts:
+                continue
 
-        if status == "completed":
-            counts[g] += 1
-        elif status == "reserved":
-            if ts is not None and (now_ts - ts) <= RESERVATION_TTL_SEC:
+            if status == "completed":
                 counts[g] += 1
-    return counts
+            elif status == "reserved":
+                if ts is not None and (now_ts - ts) <= RESERVATION_TTL_SEC:
+                    counts[g] += 1
+        return counts
+    return _retry(_do, tries=3, base_sleep=0.6)
 
 def reserve_session_sheets(now_ts: int, session_id: str, assigned_genre: str, query_track_id: str) -> None:
-    wss = ws("sessions")
-    wss.append_row([now_ts, session_id, "reserved", assigned_genre, query_track_id], value_input_option="RAW")
+    def _do():
+        wss = ws("sessions")
+        wss.append_row([now_ts, session_id, "reserved", assigned_genre, query_track_id], value_input_option="RAW")
+    _retry(_do, tries=3, base_sleep=0.6)
 
 def mark_completed_sheets(session_id: str) -> None:
-    wss = ws("sessions")
-    cell = wss.find(session_id)
-    if cell is None:
-        return
-    wss.update_cell(cell.row, 3, "completed")  # status列
+    def _do():
+        wss = ws("sessions")
+        cell = wss.find(session_id)
+        if cell is None:
+            return
+        wss.update_cell(cell.row, 3, "completed")  # status列
+    _retry(_do, tries=3, base_sleep=0.6)
 
 def is_completed_sheets(session_id: str) -> bool:
-    wss = ws("sessions")
-    cell = wss.find(session_id)
-    if cell is None:
-        return False
-    status = wss.cell(cell.row, 3).value
-    return str(status).strip() == "completed"
+    def _do():
+        wss = ws("sessions")
+        cell = wss.find(session_id)
+        if cell is None:
+            return False
+        status = wss.cell(cell.row, 3).value
+        return str(status).strip() == "completed"
+    return bool(_retry(_do, tries=3, base_sleep=0.6))
 
 def append_response_row_sheets(row: Dict[str, object]) -> None:
-    wsr = ws("responses")
-    cols = response_schema_columns()
-    values = [row.get(c, "") for c in cols]
-    wsr.append_row(values, value_input_option="RAW")
+    def _do():
+        wsr = ws("responses")
+        cols = response_schema_columns()
+        values = [row.get(c, "") for c in cols]
+        wsr.append_row(values, value_input_option="RAW")
+    _retry(_do, tries=3, base_sleep=0.6)
 
 
 ###############################################################################
@@ -388,20 +441,27 @@ V, meta, info = load_assets()
 
 # Detect backend
 USE_SHEETS = using_sheets_backend()
-if USE_SHEETS:
+
+# ---- 安定化：Sheets初期化は「起動時に1回だけ」＋失敗しても止めない ----
+if USE_SHEETS and ("sheets_ready" not in st.session_state):
     try:
         ensure_sheet_headers()
+        st.session_state["sheets_ready"] = True
     except Exception:
-        st.error("Google Sheets への接続に失敗しました。時間をおいて再読み込みしてください。")
-        st.stop()
+        st.session_state["sheets_ready"] = False
+
+# 失敗してもUIは止めない（保存時にフォールバック）
+if USE_SHEETS and not st.session_state.get("sheets_ready", False):
+    st.warning("現在、Google Sheets への接続が不安定です。回答は続けられますが、保存時に失敗する可能性があります。")
 
 # Sidebar admin
 with st.sidebar:
     with st.expander("管理者情報（クリックで展開）", expanded=False):
-        st.write(f"Backend: {'Google Sheets' if USE_SHEETS else 'Local files'}")
+        backend_name = "Google Sheets" if (USE_SHEETS and st.session_state.get("sheets_ready", False)) else "Local files"
+        st.write(f"Backend: {backend_name}")
         st.write(f"Index rows: {info['index_rows']}")
         st.write(f"Embedding dim: {info['dim']}")
-        if USE_SHEETS:
+        if USE_SHEETS and st.session_state.get("sheets_ready", False):
             st.write("Sheets: responses / sessions")
         else:
             st.write(f"responses.csv: {RESPONSES_CSV}")
@@ -413,18 +473,35 @@ if "initialised" not in st.session_state:
     now_ts = int(time.time())
     session_id = new_session_id()
 
-    if USE_SHEETS:
-        counts = count_sessions_by_genre_sheets(now_ts)
-        assigned = assign_genre_pop_reserve_from_counts(counts)
-        if assigned is None:
-            st.session_state["closed"] = True
-        else:
-            st.session_state["closed"] = False
-            st.session_state["assigned_genre"] = assigned
-            st.session_state["session_id"] = session_id
-            st.session_state["completed"] = False
-            st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
-            reserve_session_sheets(now_ts, session_id, assigned, st.session_state["query_track_id"])
+    use_sheets_now = USE_SHEETS and st.session_state.get("sheets_ready", False)
+
+    if use_sheets_now:
+        try:
+            counts = count_sessions_by_genre_sheets(now_ts)
+            assigned = assign_genre_pop_reserve_from_counts(counts)
+            if assigned is None:
+                st.session_state["closed"] = True
+            else:
+                st.session_state["closed"] = False
+                st.session_state["assigned_genre"] = assigned
+                st.session_state["session_id"] = session_id
+                st.session_state["completed"] = False
+                st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
+                reserve_session_sheets(now_ts, session_id, assigned, st.session_state["query_track_id"])
+        except Exception:
+            # Sheetsが途中で落ちたらローカルへ
+            st.session_state["sheets_ready"] = False
+            counters = load_counters_local()
+            assigned = assign_genre_pop_reserve_from_counts(counters)
+            if assigned is None:
+                st.session_state["closed"] = True
+            else:
+                st.session_state["closed"] = False
+                st.session_state["assigned_genre"] = assigned
+                st.session_state["session_id"] = session_id
+                st.session_state["completed"] = False
+                st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
+                append_session_log_local(session_id, assigned, st.session_state["query_track_id"])
     else:
         counters = load_counters_local()
         assigned = assign_genre_pop_reserve_from_counts(counters)
@@ -453,6 +530,7 @@ if "initialised" not in st.session_state:
 
         st.session_state["topk_idx"] = None
         st.session_state["topk_sim"] = None
+        st.session_state["topk_true_rank"] = None
         st.session_state["shuffle_order"] = None
 
         for L in LETTERS:
@@ -498,9 +576,15 @@ st.markdown("## ② Top5を表示")
 run = st.button("🔎 この曲から5つの楽曲を表示", type="primary")
 if run:
     q_vec = V[base_idx]
-    idx_arr, sim_arr = cosine_topk(V, q_vec, topk=TOPK_FIXED, exclude_idx=base_idx)
+    idx_arr, sim_arr, true_rank_arr = cosine_spaced_pick(
+        V, q_vec,
+        topk=TOPK_FIXED,
+        positions=SPACED_RANK_POSITIONS,
+        exclude_idx=base_idx
+    )
     st.session_state["topk_idx"] = idx_arr
     st.session_state["topk_sim"] = sim_arr
+    st.session_state["topk_true_rank"] = true_rank_arr
     rng = np.random.default_rng(RANDOM_SEED)
     st.session_state["shuffle_order"] = rng.permutation(len(idx_arr))
     for L in LETTERS:
@@ -511,15 +595,16 @@ if run:
 if st.session_state.get("topk_idx") is not None:
     idx_arr = st.session_state["topk_idx"]
     sim_arr = st.session_state["topk_sim"]
+    rank_arr = st.session_state["topk_true_rank"]
     order = st.session_state.get("shuffle_order")
 
     rows_true: List[dict] = []
-    for true_rank, (i_val, s_val) in enumerate(zip(idx_arr, sim_arr), start=1):
+    for (i_val, s_val, rnk) in zip(idx_arr, sim_arr, rank_arr):
         i_int = int(i_val)
         r = meta.iloc[i_int]
         rows_true.append({
-            "true_rank": true_rank,
-            "similarity": float(np.round(s_val, 6)),
+            "true_rank": int(rnk),  # 真順位（1,5,10,15,20 など）
+            "similarity": float(np.round(float(s_val), 6)),
             "index": i_int,
             "track_id": str(r.get("track_id","")),
             "title": str(r.get("title","") or ""),
@@ -633,11 +718,8 @@ if st.session_state.get("topk_idx") is not None:
     st.markdown("## ✅ 完了")
 
     gender_ok = st.session_state.get("gender") not in (None, "", "未回答")
-    demo_ok = (
-        st.session_state.get("music_hours_per_day") in MUSIC_HOURS_OPTIONS and
-        st.session_state.get("age") in AGE_GROUP_OPTIONS and
-        gender_ok
-    )
+    demo_ok = (st.session_state.get("music_hours_per_day") in MUSIC_HOURS_OPTIONS and
+               st.session_state.get("age") in AGE_GROUP_OPTIONS and gender_ok)
     can_submit = all_selected and no_dup and demo_ok and (not st.session_state.get("completed", False))
 
     if not gender_ok:
@@ -649,11 +731,7 @@ if st.session_state.get("topk_idx") is not None:
         if st.button("🎉 完了（保存）", type="primary", disabled=(not can_submit)):
             sid = st.session_state.get("session_id", "") or ""
 
-            if USE_SHEETS and is_completed_sheets(sid):
-                st.session_state["completed"] = True
-                st.info("このセッションは既に完了済みです。")
-                st.stop()
-
+            # ---- 保存（Sheets優先、失敗したらローカルにフォールバック） ----
             row: Dict[str, object] = {}
             row["timestamp"] = int(time.time())
             row["session_id"] = sid
@@ -677,10 +755,24 @@ if st.session_state.get("topk_idx") is not None:
             row["ui_visibility"] = int(st.session_state.get("ui_visibility", 3))
             row["free_comment"] = str(st.session_state.get("free_comment", ""))
 
-            if USE_SHEETS:
-                append_response_row_sheets(row)
-                mark_completed_sheets(sid)
-            else:
+            saved_to_sheets = False
+
+            if USE_SHEETS and st.session_state.get("sheets_ready", False):
+                try:
+                    if is_completed_sheets(sid):
+                        st.session_state["completed"] = True
+                        st.info("このセッションは既に完了済みです。")
+                        st.stop()
+
+                    append_response_row_sheets(row)
+                    mark_completed_sheets(sid)
+                    saved_to_sheets = True
+                except Exception:
+                    saved_to_sheets = False
+                    st.session_state["sheets_ready"] = False
+
+            if not saved_to_sheets:
+                # Sheetsに失敗してもデータを捨てない：ローカル保存
                 append_response_row_local(row)
                 completed_ids = load_completed_local()
                 completed_ids.add(sid)
@@ -689,6 +781,8 @@ if st.session_state.get("topk_idx") is not None:
                 g = st.session_state.get("assigned_genre","")
                 counters[g] = int(counters.get(g, 0)) + 1
                 save_counters_local(counters)
+                if USE_SHEETS:
+                    st.warning("Google Sheets への保存に失敗したため、ローカルに保存しました（管理者に連絡してください）。")
 
             st.session_state["completed"] = True
             st.success("保存しました。ご協力ありがとうございました！ブラウザを閉じて構いません。")
