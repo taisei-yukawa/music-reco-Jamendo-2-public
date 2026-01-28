@@ -91,7 +91,7 @@ PRIMARY_LIMIT: int = 10
 POP_LIMIT: int = 10
 
 QUERY_TRACKS: Dict[str, str] = {
-    "classical": "1077954",
+    "classical": "1155894",
     "jazz": "1069786",
     "rock": "1134644",
     "hiphop": "1157595",
