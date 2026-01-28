@@ -1,4 +1,3 @@
-# app.py
 # -*- coding: utf-8 -*-
 """
 Experiment App (Streamlit local/Community Cloud) - Drive Playback + pop reserve + Built-in Questionnaire
@@ -10,6 +9,23 @@ UIは維持したまま、保存先だけを自動切替：
 ★追加（表示のみ）:
 - 基準曲の再生の上に「30秒程度推奨」
 - 推薦曲の再生のところに「15秒ほど推奨」
+
+## 改善点
+
+このバージョンでは以下の点を改善しました。
+
+* **session_id の登録タイミングを変更**  
+  これまではセッション開始時に `reserve_session_sheets()` または `append_session_log_local()` を呼び出していましたが、アンケートを開始しただけで session_id が記録されてしまう問題がありました。  
+  この版では、セッション ID の登録およびステータス更新は完了ボタンを押したタイミングで行われます。初期化時にはジャンル割当てのみを行い、実際の登録は完了時に実施します。
+
+* **推薦曲の下に順位入力欄を配置**  
+  A〜E の各推薦曲の再生ボタンの下に「1〜5」から選べる順位入力欄を設け、より直感的に順位を選択できるようにしました。  
+  入力された順位は従来と同様に重複チェックを行い、未選択や重複がある場合は警告を表示します。
+
+* **基本情報（年齢・性別・音楽視聴時間）の入力を末尾に移動**  
+  ユーザー属性に関する質問をアンケートの最後にまとめ、その他の回答項目の後に表示するよう変更しました。
+
+このファイルは、元の app.py の構造や変数名を極力保ちつつ上記の修正を適用したものです。
 """
 
 from __future__ import annotations
@@ -324,6 +340,10 @@ def count_sessions_by_genre_sheets(now_ts: int) -> Dict[str, int]:
     return _retry(_do, tries=3, base_sleep=0.6)
 
 def reserve_session_sheets(now_ts: int, session_id: str, assigned_genre: str, query_track_id: str) -> None:
+    """
+    セッションの予約をシートに書き込む。status='reserved'。
+    完了時には mark_completed_sheets() で 'completed' に更新する。
+    """
     def _do():
         wss = ws("sessions")
         wss.append_row([now_ts, session_id, "reserved", assigned_genre, query_track_id], value_input_option="RAW")
@@ -423,7 +443,7 @@ def load_assets() -> Tuple[np.ndarray, pd.DataFrame, Dict[str, int]]:
 ###############################################################################
 # UI
 ###############################################################################
-st.set_page_config(page_title="Music Recommender (Experiment)", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="🎧 Music Recommender (Experiment)", layout="wide", initial_sidebar_state="collapsed")
 st.title("🎧 Music Recommender – Experiment")
 
 st.markdown(
@@ -431,8 +451,11 @@ st.markdown(
 ### このページで行うこと
 1. **基準曲**を聴く  
 2. **Top5（A〜E）**を表示して聴く（表示順はランキング順ではありません）  
-3. **順位付け（1〜5、重複不可）**と、各曲の類似度アンケートに回答  
-4. **完了**を押して送信（この時点で保存・カウントされます）
+3. **推薦曲 A〜E の順位を入力**  
+4. **各曲の類似度アンケートに回答**  
+5. **アプリ全体に関する評価と自由記述**  
+6. **基本情報（年齢・性別・音楽視聴時間）を入力**  
+7. **完了**を押して送信（この時点で保存・カウントされます）
 """
 )
 
@@ -487,7 +510,7 @@ if "initialised" not in st.session_state:
                 st.session_state["session_id"] = session_id
                 st.session_state["completed"] = False
                 st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
-                reserve_session_sheets(now_ts, session_id, assigned, st.session_state["query_track_id"])
+                # セッションの予約は完了ボタン押下時に行うため、ここでは記録しない
         except Exception:
             # Sheetsが途中で落ちたらローカルへ
             st.session_state["sheets_ready"] = False
@@ -501,7 +524,7 @@ if "initialised" not in st.session_state:
                 st.session_state["session_id"] = session_id
                 st.session_state["completed"] = False
                 st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
-                append_session_log_local(session_id, assigned, st.session_state["query_track_id"])
+                # ローカルでも予約登録は完了ボタンまで遅延
     else:
         counters = load_counters_local()
         assigned = assign_genre_pop_reserve_from_counts(counters)
@@ -513,8 +536,9 @@ if "initialised" not in st.session_state:
             st.session_state["session_id"] = session_id
             st.session_state["completed"] = False
             st.session_state["query_track_id"] = QUERY_TRACKS.get(assigned, "")
-            append_session_log_local(session_id, assigned, st.session_state["query_track_id"])
+            # ローカルでも予約登録は完了ボタンまで遅延
 
+    # 初期化：ベース曲のインデックスを決定
     if not st.session_state.get("closed"):
         base_idx: Optional[int] = None
         qid = normalize_track_id(st.session_state["query_track_id"])
@@ -533,14 +557,17 @@ if "initialised" not in st.session_state:
         st.session_state["topk_true_rank"] = None
         st.session_state["shuffle_order"] = None
 
+        # 初期値：順位や評価を初期化
         for L in LETTERS:
             st.session_state[f"rank_{L}"] = None
         for L in LETTERS:
             for feat in FEATURES:
                 st.session_state[f"{L}_{feat}"] = 3
+        # 基本情報を初期化
         st.session_state["music_hours_per_day"] = MUSIC_HOURS_OPTIONS[0]
         st.session_state["age"] = AGE_GROUP_OPTIONS[1]
         st.session_state["gender"] = "未回答"
+        # アプリ評価
         st.session_state["usability"] = 3
         st.session_state["ui_visibility"] = 3
         st.session_state["free_comment"] = ""
@@ -591,13 +618,14 @@ if run:
         st.session_state[f"rank_{L}"] = None
     st.rerun()
 
-# Step 3
+# Step 3 onward: show recommendations and collect survey
 if st.session_state.get("topk_idx") is not None:
     idx_arr = st.session_state["topk_idx"]
     sim_arr = st.session_state["topk_sim"]
     rank_arr = st.session_state["topk_true_rank"]
     order = st.session_state.get("shuffle_order")
 
+    # prepare mapping of true rows
     rows_true: List[dict] = []
     for (i_val, s_val, rnk) in zip(idx_arr, sim_arr, rank_arr):
         i_int = int(i_val)
@@ -614,6 +642,7 @@ if st.session_state.get("topk_idx") is not None:
     rows_disp = [rows_true[i] for i in order] if order is not None else rows_true
     disp_map = {L: row for L, row in zip(LETTERS, rows_disp)}
 
+    # Step 3: Recommend tracks with ranking input below each
     st.markdown("## ③ 推薦曲（A〜E）")
     st.caption("A〜Eの表示順はランキング順ではありません。")
     for L in LETTERS:
@@ -625,47 +654,28 @@ if st.session_state.get("topk_idx") is not None:
             header += f" — {r['artist']}"
         st.markdown(f"### {header}")
         st.caption("※ 15秒ほどの試聴を推奨します")
-        play_by_meta_row(meta.iloc[int(r["index"])])
-
-    st.markdown("## ④ アンケート")
-
-    with st.expander("基本情報（年齢・性別・音楽視聴時間）", expanded=True):
-        st.session_state["music_hours_per_day"] = st.radio(
-            "1日にどれくらい音楽を聴きますか",
-            options=MUSIC_HOURS_OPTIONS,
-            index=MUSIC_HOURS_OPTIONS.index(st.session_state.get("music_hours_per_day", MUSIC_HOURS_OPTIONS[0])),
-            horizontal=True,
+        # audio playback
+        play_by_meta_row(meta.iloc[int(r["index"])] )
+        # ranking input below audio
+        rank_key = f"rank_{L}"
+        # prepare options and current value
+        rank_options = ["未選択", "1", "2", "3", "4", "5"]
+        current_rank = st.session_state.get(rank_key)
+        idx_sel = 0
+        if isinstance(current_rank, int) and 1 <= current_rank <= 5:
+            try:
+                idx_sel = rank_options.index(str(current_rank))
+            except ValueError:
+                idx_sel = 0
+        sel = st.selectbox(
+            f"{L} の順位を選択",
+            options=rank_options,
+            index=idx_sel,
+            key=f"ui_{rank_key}"
         )
-        st.session_state["age"] = st.radio(
-            "年齢",
-            options=AGE_GROUP_OPTIONS,
-            index=AGE_GROUP_OPTIONS.index(st.session_state.get("age", AGE_GROUP_OPTIONS[1])),
-            horizontal=True,
-        )
-        st.session_state["gender"] = st.selectbox(
-            "性別",
-            options=GENDER_OPTIONS,
-            index=GENDER_OPTIONS.index(st.session_state.get("gender", "未回答")) if st.session_state.get("gender","未回答") in GENDER_OPTIONS else 0,
-        )
+        st.session_state[rank_key] = None if sel == "未選択" else int(sel)
 
-    st.markdown("### ✅ 順位付け（似ている順に 1〜5、重複不可）")
-
-    def rank_select(letter: str):
-        key = f"rank_{letter}"
-        options = ["未選択", "1", "2", "3", "4", "5"]
-        cur = st.session_state.get(key)
-        idx = 0
-        if isinstance(cur, int) and 1 <= cur <= 5:
-            idx = options.index(str(cur))
-        sel = st.selectbox(f"{letter} の順位", options=options, index=idx, key=f"ui_{key}")
-        st.session_state[key] = None if sel == "未選択" else int(sel)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        rank_select("A"); rank_select("C"); rank_select("E")
-    with c2:
-        rank_select("B"); rank_select("D")
-
+    # Validate ranking selections
     ranks = [st.session_state.get(f"rank_{L}") for L in LETTERS]
     all_selected = all(isinstance(v, int) for v in ranks)
     no_dup = (len(set(ranks)) == 5) if all_selected else False
@@ -676,7 +686,8 @@ if st.session_state.get("topk_idx") is not None:
     else:
         st.success("順位の入力はOKです。")
 
-    st.markdown("### 🎚️ 類似度評価（1=似ていない ～ 5=とても似ている）")
+    # Step 4: Similarity evaluation
+    st.markdown("## ④ 類似度評価（1=似ていない ～ 5=とても似ている）")
     label_map = {
         "tempo": "テンポ（速さ）",
         "rhythm": "リズム（ノリ）",
@@ -695,7 +706,8 @@ if st.session_state.get("topk_idx") is not None:
                     step=1, key=f"ui_{k}"
                 )
 
-    st.markdown("### 💡 アプリについて")
+    # Step 5: App evaluation and free comment
+    st.markdown("## ⑤ アプリについて")
     st.session_state["usability"] = st.slider(
         "アプリの使いやすさ（1=悪い ～ 5=良い）",
         min_value=LIKERT_MIN, max_value=LIKERT_MAX,
@@ -715,7 +727,30 @@ if st.session_state.get("topk_idx") is not None:
         height=120
     )
 
-    st.markdown("## ✅ 完了")
+    # Step 6: Basic demographic information moved to the end
+    st.markdown("## ⑥ 基本情報（年齢・性別・音楽視聴時間）")
+    # We still group these in an expander for compactness
+    with st.expander("基本情報を入力（クリックで展開）", expanded=True):
+        st.session_state["music_hours_per_day"] = st.radio(
+            "1日にどれくらい音楽を聴きますか",
+            options=MUSIC_HOURS_OPTIONS,
+            index=MUSIC_HOURS_OPTIONS.index(st.session_state.get("music_hours_per_day", MUSIC_HOURS_OPTIONS[0])),
+            horizontal=True,
+        )
+        st.session_state["age"] = st.radio(
+            "年齢",
+            options=AGE_GROUP_OPTIONS,
+            index=AGE_GROUP_OPTIONS.index(st.session_state.get("age", AGE_GROUP_OPTIONS[1])),
+            horizontal=True,
+        )
+        st.session_state["gender"] = st.selectbox(
+            "性別",
+            options=GENDER_OPTIONS,
+            index=GENDER_OPTIONS.index(st.session_state.get("gender", "未回答")) if st.session_state.get("gender","未回答") in GENDER_OPTIONS else 0,
+        )
+
+    # Step 7: Completion section
+    st.markdown("## ⑦ 完了")
 
     gender_ok = st.session_state.get("gender") not in (None, "", "未回答")
     demo_ok = (st.session_state.get("music_hours_per_day") in MUSIC_HOURS_OPTIONS and
@@ -730,10 +765,11 @@ if st.session_state.get("topk_idx") is not None:
     else:
         if st.button("🎉 完了（保存）", type="primary", disabled=(not can_submit)):
             sid = st.session_state.get("session_id", "") or ""
+            now_ts = int(time.time())
 
             # ---- 保存（Sheets優先、失敗したらローカルにフォールバック） ----
             row: Dict[str, object] = {}
-            row["timestamp"] = int(time.time())
+            row["timestamp"] = now_ts
             row["session_id"] = sid
             row["assigned_genre"] = st.session_state.get("assigned_genre", "")
             row["query_track_id"] = st.session_state.get("query_track_id", "")
@@ -759,13 +795,17 @@ if st.session_state.get("topk_idx") is not None:
 
             if USE_SHEETS and st.session_state.get("sheets_ready", False):
                 try:
+                    # 二重登録を避ける
                     if is_completed_sheets(sid):
                         st.session_state["completed"] = True
                         st.info("このセッションは既に完了済みです。")
                         st.stop()
 
-                    append_response_row_sheets(row)
+                    # 予約してその場で完了マークを付ける
+                    reserve_session_sheets(now_ts, sid, st.session_state.get("assigned_genre",""), st.session_state.get("query_track_id",""))
                     mark_completed_sheets(sid)
+                    # 回答を保存
+                    append_response_row_sheets(row)
                     saved_to_sheets = True
                 except Exception:
                     saved_to_sheets = False
@@ -774,6 +814,8 @@ if st.session_state.get("topk_idx") is not None:
             if not saved_to_sheets:
                 # Sheetsに失敗してもデータを捨てない：ローカル保存
                 append_response_row_local(row)
+                # セッションログもローカルに保存
+                append_session_log_local(sid, st.session_state.get("assigned_genre",""), st.session_state.get("query_track_id",""))
                 completed_ids = load_completed_local()
                 completed_ids.add(sid)
                 save_completed_local(completed_ids)
